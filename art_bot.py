@@ -4,7 +4,6 @@ Generates a 3-image series per hour by rotating across 7 AI image platforms:
   - Grok (grok.com)          — Aurora model, strong painterly/surreal
   - Leonardo.ai              — DreamShaper / Alchemy, rich fantasy/concept art
   - Adobe Firefly            — Firefly model, photorealistic / fine-art painterly
-  - EaseMate.ai              — Nano Banana model, wild/unique/engaging outputs
   - ChatGPT (chatgpt.com)    — DALL-E 3 via GPT-4o, versatile and descriptive
   - Raphael.app              — fast high-quality generation, clean aesthetic
   - Google Gemini            — Imagen 3, photorealistic and painterly
@@ -51,8 +50,8 @@ CHATGPT_URL   = "https://chatgpt.com/"
 RAPHAEL_URL   = "https://raphael.app/"
 GEMINI_URL    = "https://gemini.google.com/"
 
-# Equal weight rotation across all 7 sources (Bing removed — image quality too low)
-SOURCES = ["grok", "leonardo", "firefly", "easemate", "chatgpt", "raphael", "gemini"]
+# Equal weight rotation across all 6 sources (Bing removed — quality; EaseMate removed — broken)
+SOURCES = ["grok", "leonardo", "firefly", "chatgpt", "raphael", "gemini"]
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -1217,7 +1216,6 @@ _GENERATOR_FNS = {
     "grok":     None,                   # handled inside generate_image() directly
     "leonardo": generate_via_leonardo,
     "firefly":  generate_via_firefly,
-    "easemate": generate_via_easemate,
     "chatgpt":  generate_via_chatgpt,
     "raphael":  generate_via_raphael,
     "gemini":   generate_via_gemini,
@@ -1227,7 +1225,6 @@ _SOURCE_URLS = {
     "grok":     GROK_URL,
     "leonardo": LEONARDO_URL,
     "firefly":  FIREFLY_URL,
-    "easemate": EASEMATE_URL,
     "chatgpt":  CHATGPT_URL,
     "raphael":  RAPHAEL_URL,
     "gemini":   GEMINI_URL,
@@ -1484,7 +1481,6 @@ _LOGIN_SITES = {
     "grok":      (GROK_URL,     "grok.com",       "Log in to grok.com with your X account"),
     "leonardo":  (LEONARDO_URL, "Leonardo.ai",    "Log in to Leonardo.ai (Google or email)"),
     "firefly":   (FIREFLY_URL,  "Adobe Firefly",  "Log in to Adobe Firefly with your Adobe account"),
-    "easemate":  (EASEMATE_URL, "EaseMate.ai",    "Log in to EaseMate.ai (Google or email)"),
     "chatgpt":   (CHATGPT_URL,  "ChatGPT",        "Log in to ChatGPT with your OpenAI account"),
     "raphael":   (RAPHAEL_URL,  "Raphael.app",    "Log in to Raphael.app (Google or email)"),
     "gemini":    (GEMINI_URL,   "Google Gemini",  "Log in to Gemini with your Google account"),
@@ -1552,7 +1548,7 @@ def main():
             print("  series [N]    — generate an N-image series (default 3)")
             print("  fill [N]      — generate series back-to-back until folder has N images (default 25)")
             print("  login [site]  — log in to a source site and save session")
-            print("                  sites: grok, leonardo, firefly, bing, easemate, all")
+            print("                  sites: grok, leonardo, firefly, chatgpt, raphael, gemini, all")
             print("  test          — print a sample prompt, no browser opened")
     else:
         run_series(n=3)

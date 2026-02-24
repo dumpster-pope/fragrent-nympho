@@ -903,13 +903,44 @@ class InstagramBot:
             # ── Step 3: enable carousel mode and upload remaining images ────
             if len(image_paths) > 1:
                 select_multiple = find_first(driver, [
+                    # aria-label variants Instagram has used over time
                     (By.CSS_SELECTOR, "svg[aria-label='Select multiple']"),
+                    (By.CSS_SELECTOR, "[aria-label='Select multiple']"),
+                    (By.CSS_SELECTOR, "[aria-label='Select Multiple']"),
                     (By.XPATH, "//*[@aria-label='Select multiple']"),
-                    (By.XPATH, "//button[contains(@aria-label,'multiple')]"),
+                    (By.XPATH, "//*[@aria-label='Select Multiple']"),
+                    (By.XPATH, "//*[contains(@aria-label,'multiple')]"),
+                    (By.XPATH, "//*[contains(@aria-label,'Multiple')]"),
+                    # stacked-photos / gallery icon button
+                    (By.CSS_SELECTOR, "button[aria-label*='multiple' i]"),
+                    (By.CSS_SELECTOR, "div[role='button'][aria-label*='multiple' i]"),
+                    (By.XPATH, "//button[contains(translate(@aria-label,'SELECTMULIPE','selectmulipe'),'multiple')]"),
                 ], timeout=10)
 
+                # JS fallback: scan every element with an aria-label for "multiple"
+                if not select_multiple:
+                    try:
+                        select_multiple = driver.execute_script("""
+                            var els = document.querySelectorAll('[aria-label]');
+                            for (var i = 0; i < els.length; i++) {
+                                var lbl = (els[i].getAttribute('aria-label') || '').toLowerCase();
+                                if (lbl.includes('multiple')) return els[i];
+                            }
+                            var titles = document.querySelectorAll('svg title');
+                            for (var i = 0; i < titles.length; i++) {
+                                if (titles[i].textContent.toLowerCase().includes('multiple')) {
+                                    return titles[i].closest('button') || titles[i].closest('[role="button"]');
+                                }
+                            }
+                            return null;
+                        """)
+                        if select_multiple:
+                            log.debug("Carousel button found via JS aria-label scan")
+                    except Exception:
+                        pass
+
                 if select_multiple:
-                    select_multiple.click()
+                    driver.execute_script("arguments[0].click();", select_multiple)
                     log.info("Carousel mode enabled.")
                     time.sleep(2)
 
