@@ -1,11 +1,13 @@
 """
 AI Art Bot - Multi-Source Browser Automation
-Generates 1 artistic image per hour by rotating across 5 AI image platforms:
+Generates a 3-image series per hour by rotating across 7 AI image platforms:
   - Grok (grok.com)          — Aurora model, strong painterly/surreal
   - Leonardo.ai              — DreamShaper / Alchemy, rich fantasy/concept art
   - Adobe Firefly            — Firefly model, photorealistic / fine-art painterly
-  - Bing Image Creator       — DALL-E 3, versatile high-quality diverse styles
   - EaseMate.ai              — Nano Banana model, wild/unique/engaging outputs
+  - ChatGPT (chatgpt.com)    — DALL-E 3 via GPT-4o, versatile and descriptive
+  - Raphael.app              — fast high-quality generation, clean aesthetic
+  - Google Gemini            — Imagen 3, photorealistic and painterly
 Saves to Desktop/AI_Art/
 Run once per hour via Windows Task Scheduler (see setup_scheduler.ps1)
 """
@@ -44,11 +46,13 @@ SERIES_MANIFEST = BOT_DIR / "series_manifest.json"
 GROK_URL      = "https://grok.com"
 LEONARDO_URL  = "https://app.leonardo.ai/ai-generations"
 FIREFLY_URL   = "https://firefly.adobe.com/generate/images"
-BING_URL      = "https://www.bing.com/images/create"
 EASEMATE_URL  = "https://www.easemate.ai/ai-image-generator"
+CHATGPT_URL   = "https://chatgpt.com/"
+RAPHAEL_URL   = "https://raphael.app/"
+GEMINI_URL    = "https://gemini.google.com/"
 
-# Equal weight rotation across all 5 sources
-SOURCES = ["grok", "leonardo", "firefly", "bing", "easemate"]
+# Equal weight rotation across all 7 sources (Bing removed — image quality too low)
+SOURCES = ["grok", "leonardo", "firefly", "easemate", "chatgpt", "raphael", "gemini"]
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -797,6 +801,21 @@ def generate_via_leonardo(driver, prompt: str) -> str | None:
     slow_type(textarea, prompt[:480])
     time.sleep(1)
 
+    # ── Set image count to 2 to preserve daily tokens ─────────────────────
+    try:
+        count_btn = driver.find_element(
+            By.XPATH,
+            "(//label[contains(translate(.,'NUMBER OF IMAGES','number of images'),'number of images')]"
+            "/following::button[normalize-space()='2']"
+            "| //button[@data-testid='image-count-2']"
+            "| //button[@aria-label='2 images'])[1]",
+        )
+        driver.execute_script("arguments[0].click();", count_btn)
+        log.info("Leonardo: image count set to 2")
+        time.sleep(0.5)
+    except Exception:
+        log.debug("Leonardo: image count selector not found — using default")
+
     gen_btn = find_first(driver, [
         (By.XPATH, "//button[normalize-space()='Generate']"),
         (By.CSS_SELECTOR, "button[aria-label*='Generate' i]"),
@@ -1055,22 +1074,163 @@ def generate_via_easemate(driver, prompt: str) -> str | None:
     ])
 
 
+# ── ChatGPT / DALL-E 3 generator ──────────────────────────────────────────────
+
+def generate_via_chatgpt(driver, prompt: str) -> str | None:
+    """Submit a prompt to ChatGPT and return the DALL-E 3 generated image URL."""
+    log.info("ChatGPT: loading…")
+    driver.get(CHATGPT_URL)
+    time.sleep(6)
+
+    # ── 1. Find the chat input ─────────────────────────────────────────────
+    prompt_el = find_first(driver, [
+        (By.CSS_SELECTOR, "#prompt-textarea"),
+        (By.CSS_SELECTOR, "div[contenteditable='true'][data-lexical-editor]"),
+        (By.CSS_SELECTOR, "div[contenteditable='true']"),
+        (By.CSS_SELECTOR, "textarea[placeholder*='Message' i]"),
+    ], timeout=20)
+    if not prompt_el:
+        log.error("ChatGPT: prompt input not found")
+        return None
+
+    # ── 2. Type the prompt, prefixed to trigger DALL-E image generation ────
+    prompt_el.click()
+    time.sleep(0.5)
+    slow_type(prompt_el, f"Generate an image: {prompt[:450]}")
+    time.sleep(1)
+
+    # ── 3. Submit ──────────────────────────────────────────────────────────
+    submit_el = find_first(driver, [
+        (By.CSS_SELECTOR, "button[data-testid='send-button']"),
+        (By.CSS_SELECTOR, "button[aria-label='Send prompt']"),
+        (By.XPATH, "//button[@aria-label='Send message']"),
+    ], timeout=5)
+    if submit_el:
+        driver.execute_script("arguments[0].click();", submit_el)
+    else:
+        prompt_el.send_keys(Keys.RETURN)
+    log.info("ChatGPT: generating… (up to 120 s)")
+    time.sleep(15)
+
+    return _wait_for_large_image(driver, timeout=105, cdn_hints=[
+        "files.oaiusercontent.com", "oaidalleapiprodscus", "oaidalleus",
+    ])
+
+
+# ── Raphael.app generator ─────────────────────────────────────────────────────
+
+def generate_via_raphael(driver, prompt: str) -> str | None:
+    """Submit a prompt to Raphael.app and return the generated image URL."""
+    log.info("Raphael: loading…")
+    driver.get(RAPHAEL_URL)
+    time.sleep(5)
+
+    # ── 1. Find the prompt input ───────────────────────────────────────────
+    prompt_el = find_first(driver, [
+        (By.CSS_SELECTOR, "textarea[placeholder*='Describe' i]"),
+        (By.CSS_SELECTOR, "textarea[placeholder*='Enter' i]"),
+        (By.CSS_SELECTOR, "textarea[placeholder*='prompt' i]"),
+        (By.CSS_SELECTOR, "input[placeholder*='prompt' i]"),
+        (By.CSS_SELECTOR, "textarea"),
+    ], timeout=15)
+    if not prompt_el:
+        log.error("Raphael: prompt input not found")
+        return None
+
+    prompt_el.click()
+    time.sleep(0.5)
+    try:
+        prompt_el.clear()
+    except Exception:
+        pass
+    slow_type(prompt_el, prompt[:480])
+    time.sleep(1)
+
+    # ── 2. Click Generate ──────────────────────────────────────────────────
+    gen_btn = find_first(driver, [
+        (By.XPATH, "//button[normalize-space()='Generate']"),
+        (By.XPATH, "//button[contains(normalize-space(),'Generate')]"),
+        (By.CSS_SELECTOR, "button[type='submit']"),
+        (By.CSS_SELECTOR, "[class*='generate'][class*='btn'], [class*='btn'][class*='generate']"),
+    ], timeout=12)
+    if not gen_btn:
+        log.error("Raphael: Generate button not found")
+        return None
+
+    driver.execute_script("arguments[0].click();", gen_btn)
+    log.info("Raphael: generating… (up to 120 s)")
+    time.sleep(10)
+
+    return _wait_for_large_image(driver, timeout=110, cdn_hints=[
+        "raphael.app", "cdn.raphael", "storage", "output", "result",
+    ])
+
+
+# ── Google Gemini / Imagen generator ─────────────────────────────────────────
+
+def generate_via_gemini(driver, prompt: str) -> str | None:
+    """Submit a prompt to Google Gemini and return the Imagen-generated image URL."""
+    log.info("Gemini: loading…")
+    driver.get(GEMINI_URL)
+    time.sleep(6)
+
+    # ── 1. Find the chat input ─────────────────────────────────────────────
+    prompt_el = find_first(driver, [
+        (By.CSS_SELECTOR, "div[contenteditable='true']"),
+        (By.CSS_SELECTOR, "rich-textarea div[contenteditable]"),
+        (By.CSS_SELECTOR, "textarea"),
+        (By.XPATH, "//div[@role='textbox']"),
+    ], timeout=20)
+    if not prompt_el:
+        log.error("Gemini: prompt input not found")
+        return None
+
+    # ── 2. Type the prompt ─────────────────────────────────────────────────
+    prompt_el.click()
+    time.sleep(0.5)
+    slow_type(prompt_el, f"Create an image: {prompt[:450]}")
+    time.sleep(1)
+
+    # ── 3. Submit ──────────────────────────────────────────────────────────
+    submit_el = find_first(driver, [
+        (By.CSS_SELECTOR, "button[aria-label='Send message']"),
+        (By.CSS_SELECTOR, "button.send-button"),
+        (By.XPATH, "//button[contains(@aria-label,'Send')]"),
+        (By.XPATH, "//mat-icon[text()='send']/parent::button"),
+    ], timeout=5)
+    if submit_el:
+        driver.execute_script("arguments[0].click();", submit_el)
+    else:
+        prompt_el.send_keys(Keys.RETURN)
+    log.info("Gemini: generating… (up to 120 s)")
+    time.sleep(15)
+
+    return _wait_for_large_image(driver, timeout=105, cdn_hints=[
+        "googleusercontent.com", "lh3.googleusercontent", "generativelanguage",
+        "gemini", "image-generation",
+    ])
+
+
 # ── Source dispatch table ─────────────────────────────────────────────────────
 
 _GENERATOR_FNS = {
-    "grok":     None,          # handled inside generate_image() directly
+    "grok":     None,                   # handled inside generate_image() directly
     "leonardo": generate_via_leonardo,
     "firefly":  generate_via_firefly,
-    "bing":     generate_via_bing,
     "easemate": generate_via_easemate,
+    "chatgpt":  generate_via_chatgpt,
+    "raphael":  generate_via_raphael,
+    "gemini":   generate_via_gemini,
 }
 
 _SOURCE_URLS = {
     "grok":     GROK_URL,
     "leonardo": LEONARDO_URL,
     "firefly":  FIREFLY_URL,
-    "bing":     BING_URL,
     "easemate": EASEMATE_URL,
+    "chatgpt":  CHATGPT_URL,
+    "raphael":  RAPHAEL_URL,
+    "gemini":   GEMINI_URL,
 }
 
 
@@ -1201,6 +1361,34 @@ def run_series(n: int = 3) -> list[str]:
     # 7. Update config
     cfg["last_run"] = datetime.now().isoformat()
     save_config(cfg)
+
+    # 8. Auto-post to Instagram immediately after saving
+    if results:
+        try:
+            from instagram_bot import (
+                InstagramBot, load_config as _ig_load_config,
+                build_series_caption, pick_unposted_series,
+                mark_series_posted, load_tracker,
+            )
+            ig_cfg         = _ig_load_config()
+            series_result  = pick_unposted_series()
+            if series_result:
+                s_id, s_data, s_paths = series_result
+                caption  = build_series_caption(s_data)
+                tracker  = load_tracker()
+                bot      = InstagramBot(ig_cfg)
+                log.info(f"Auto-posting series {s_id} to Instagram…")
+                success, post_url = bot.post_series([str(p) for p in s_paths], caption)
+                if success:
+                    mark_series_posted(s_id, [str(p) for p in s_paths], tracker, post_url)
+                    log.info("Series auto-posted to Instagram successfully.")
+                else:
+                    log.warning("Instagram auto-post failed — series saved for manual posting via: python instagram_bot.py force")
+            else:
+                log.warning("Auto-post: no unposted series found (unexpected)")
+        except Exception as exc:
+            log.warning(f"Instagram auto-post failed (non-fatal): {exc}")
+
     return results
 
 
@@ -1293,11 +1481,13 @@ def fill_stock(target: int = 25) -> None:
 
 
 _LOGIN_SITES = {
-    "grok":      (GROK_URL,     "grok.com",               "Log in to grok.com with your X account"),
-    "leonardo":  (LEONARDO_URL, "Leonardo.ai",            "Log in to Leonardo.ai (Google or email)"),
-    "firefly":   (FIREFLY_URL,  "Adobe Firefly",          "Log in to Adobe Firefly with your Adobe account"),
-    "bing":      (BING_URL,     "Bing Image Creator",     "Log in to Bing with your Microsoft account"),
-    "easemate":  (EASEMATE_URL, "EaseMate.ai",            "Log in to EaseMate.ai (Google or email)"),
+    "grok":      (GROK_URL,     "grok.com",       "Log in to grok.com with your X account"),
+    "leonardo":  (LEONARDO_URL, "Leonardo.ai",    "Log in to Leonardo.ai (Google or email)"),
+    "firefly":   (FIREFLY_URL,  "Adobe Firefly",  "Log in to Adobe Firefly with your Adobe account"),
+    "easemate":  (EASEMATE_URL, "EaseMate.ai",    "Log in to EaseMate.ai (Google or email)"),
+    "chatgpt":   (CHATGPT_URL,  "ChatGPT",        "Log in to ChatGPT with your OpenAI account"),
+    "raphael":   (RAPHAEL_URL,  "Raphael.app",    "Log in to Raphael.app (Google or email)"),
+    "gemini":    (GEMINI_URL,   "Google Gemini",  "Log in to Gemini with your Google account"),
 }
 
 
@@ -1346,12 +1536,11 @@ def main():
             n = int(sys.argv[2]) if len(sys.argv) > 2 else 3
             run_series(n=n)
         elif cmd == "login":
-            # login [site]  — default: grok
-            site = sys.argv[2].lower() if len(sys.argv) > 2 else "grok"
-            if site == "all":
-                for s in _LOGIN_SITES:
-                    setup_login_site(s)
-            else:
+            # login [site [site ...]]  — one or more sites, or "all"
+            sites = [s.lower() for s in sys.argv[2:]] if len(sys.argv) > 2 else ["grok"]
+            if sites == ["all"]:
+                sites = list(_LOGIN_SITES.keys())
+            for site in sites:
                 setup_login_site(site)
         elif cmd == "fill":
             target = int(sys.argv[2]) if len(sys.argv) > 2 else 25
