@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs
+logs/
+
+# Runtime data
+config.json
+posted_tracker.json
+series_manifest.json
+prompt_history.json
+
+# Chrome profile (contains login sessions — never commit)
+chrome_profile*/
+ChromeProfile*/
+
+# Temp files
+_tmp_caption.txt
+
+# Screenshots saved by bot
+logs/*.png

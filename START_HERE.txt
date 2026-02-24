@@ -1,0 +1,98 @@
+╔════════════════════════════════════════════════════════════════╗
+║                                                                ║
+║              🎨 AI ART BOT - START HERE! 🎨                    ║
+║                                                                ║
+║         Automated DALL-E Image Generation + Instagram          ║
+║                                                                ║
+╚════════════════════════════════════════════════════════════════╝
+
+👋 Welcome! Your AI art bot is ready to set up.
+
+📂 PROJECT LOCATION
+   C:\Users\gageg\AIArtBot\
+
+
+🚀 QUICKEST WAY TO GET STARTED (5 minutes)
+
+   1. Open PowerShell or Command Prompt in this folder
+   
+   2. Run the setup wizard:
+      
+      python setup_wizard.py
+   
+   3. Follow the prompts to enter:
+      - Your OpenAI API key (get from: platform.openai.com)
+      - Your Instagram username
+      - How many images per day (3-6)
+   
+   4. Login to Instagram on Chrome and leave it logged in
+   
+   5. Test it:
+      
+      python art_bot.py test       (test prompts - free)
+      python art_bot.py generate   (generate images - $0.04 each)
+      python art_bot.py post       (post to Instagram)
+   
+   6. Automate it (PowerShell as Administrator):
+      
+      .\setup_scheduler.ps1
+
+
+📖 DOCUMENTATION FILES
+
+   QUICKSTART.md       - 5-minute setup guide
+   README.md           - Complete documentation
+   TROUBLESHOOTING.md  - Fix common problems
+   PROJECT_SUMMARY.md  - What this bot does
+
+
+💰 COSTS
+
+   DALL-E 3 costs ~$0.04 per image
+   
+   4 images/day = $0.16/day = $4.80/month
+   6 images/day = $0.24/day = $7.20/month
+
+
+🎯 WHAT IT DOES
+
+   ✅ Generates 3-6 ultra-creative AI art prompts daily
+   ✅ Creates images using DALL-E 3 (high quality)
+   ✅ Saves images locally with metadata
+   ✅ Posts to Instagram automatically throughout the day
+   ✅ Captions include date, time, and full prompt
+   ✅ Fully automated with Windows Task Scheduler
+
+
+⏰ AUTOMATED SCHEDULE (after running setup_scheduler.ps1)
+
+   2:00 AM  - Generate today's images
+   9:00 AM  - Post image #1
+   12:00 PM - Post image #2
+   3:00 PM  - Post image #3
+   6:00 PM  - Post image #4
+
+
+🛠️ BASIC COMMANDS
+
+   python art_bot.py test       Test prompt generation (free)
+   python art_bot.py generate   Generate images (uses API credits)
+   python art_bot.py post       Post next image to Instagram
+   python setup_wizard.py       Interactive configuration
+
+
+❓ NEED HELP?
+
+   1. Read TROUBLESHOOTING.md
+   2. Check logs in the logs/ folder
+   3. Make sure you have Python 3.8+ installed
+   4. Verify your OpenAI API key is valid
+   
+
+🎉 READY TO GO!
+
+   Start with: python setup_wizard.py
+
+   Then test with: python art_bot.py test
+
+   Have fun with your automated AI art feed! 🚀✨
