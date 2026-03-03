@@ -18,14 +18,17 @@ $action = New-ScheduledTaskAction `
     -Argument         "`"$agentPath`" run" `
     -WorkingDirectory $workDir
 
-# Trigger: daily at 01:00, repeat every 6 hours indefinitely
-$trigger = New-ScheduledTaskTrigger `
-    -Daily `
-    -At "01:00"
+# Trigger: start at next 01:00, repeat every 6 hours indefinitely
+# (-Once + -RepetitionInterval is the correct pattern; -Daily doesn't expose RepetitionInterval)
+$now      = Get-Date
+$nextRun  = $now.Date.AddHours(1)   # today at 01:00
+if ($nextRun -le $now) { $nextRun = $nextRun.AddDays(1) }   # already past — use tomorrow
 
-# Add repetition to the trigger (every 6 hours, indefinitely)
-$trigger.RepetitionInterval = (New-TimeSpan -Hours 6)
-$trigger.RepetitionDuration = ([System.TimeSpan]::MaxValue)
+$trigger = New-ScheduledTaskTrigger `
+    -Once `
+    -At                 $nextRun `
+    -RepetitionInterval (New-TimeSpan -Hours 6)
+    # No -RepetitionDuration means the repetition runs indefinitely
 
 # Settings
 $settings = New-ScheduledTaskSettingsSet `
