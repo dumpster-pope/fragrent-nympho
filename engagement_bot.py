@@ -234,51 +234,139 @@ def _like_current_post(driver) -> bool:
 
 def _comment_current_post(driver, comment_text: str) -> bool:
     """Leave a comment on the currently open post. Returns True on success."""
+    from selenium.webdriver.common.action_chains import ActionChains
+
+    log.info("[engagement] Attempting to comment on post…")
     try:
-        # First try to find a visible comment textarea
+        # Scroll so the comment section is visible
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.6);")
+        _pause(1.5, 2.5)
+
         comment_box = None
+
+        # Diagnostic: log all contenteditable divs present on page
+        all_ce = driver.find_elements(By.CSS_SELECTOR, "div[contenteditable='true']")
+        all_ta = driver.find_elements(By.CSS_SELECTOR, "textarea")
+        log.info(f"[engagement] Found {len(all_ce)} contenteditable divs, {len(all_ta)} textareas")
+        for el in all_ce:
+            log.info(
+                f"  contenteditable: aria-label={el.get_attribute('aria-label')!r} "
+                f"placeholder={el.get_attribute('placeholder')!r} "
+                f"aria-placeholder={el.get_attribute('aria-placeholder')!r}"
+            )
+
+        # Try direct selectors first
         for sel in [
+            "div[contenteditable='true'][aria-label*='comment' i]",
+            "div[contenteditable='true'][aria-placeholder*='comment' i]",
             "textarea[placeholder*='Add a comment' i]",
-            "textarea[placeholder*='comment' i]",
             "form textarea",
         ]:
             els = driver.find_elements(By.CSS_SELECTOR, sel)
             if els:
                 comment_box = els[0]
+                log.info(f"[engagement] Comment box found via: {sel}")
                 break
 
-        # If not found, click the comment icon to open the input
+        # Click the Comment bubble icon to focus the input if not found yet
         if not comment_box:
-            icon_clicked = driver.execute_script("""
-                var svgs = document.querySelectorAll('svg[aria-label="Comment"]');
-                for (var i = 0; i < svgs.length; i++) {
-                    var btn = svgs[i].closest('button') || svgs[i].parentElement;
-                    if (btn) { btn.click(); return true; }
+            log.info("[engagement] Comment box not found — clicking Comment icon to reveal it")
+            driver.execute_script("""
+                var candidates = [
+                    document.querySelector('svg[aria-label="Comment"]'),
+                    document.querySelector('[aria-label="Comment"]'),
+                ];
+                for (var c of candidates) {
+                    if (c) { (c.closest('button') || c.parentElement || c).click(); break; }
                 }
-                return false;
             """)
-            if icon_clicked:
-                _pause(1.0, 2.0)
-                for sel in ["textarea[placeholder*='Add a comment' i]", "form textarea", "textarea"]:
-                    els = driver.find_elements(By.CSS_SELECTOR, sel)
-                    if els:
-                        comment_box = els[0]
-                        break
+            _pause(2.0, 3.0)
+            for sel in [
+                "div[contenteditable='true'][aria-label*='comment' i]",
+                "div[contenteditable='true'][aria-placeholder*='comment' i]",
+                "textarea[placeholder*='Add a comment' i]",
+                "div[contenteditable='true']",
+                "form textarea",
+                "textarea",
+            ]:
+                els = driver.find_elements(By.CSS_SELECTOR, sel)
+                if els:
+                    comment_box = els[0]
+                    log.info(f"[engagement] Comment box found (after icon click) via: {sel}")
+                    break
 
         if not comment_box:
+            log.warning("[engagement] Comment box not found — skipping comment")
             return False
 
-        comment_box.click()
-        _pause(0.5, 1.2)
-        comment_box.send_keys(comment_text)
-        _pause(0.8, 1.8)
-        comment_box.send_keys(Keys.RETURN)
-        log.info(f"[engagement] Commented: {comment_text}")
-        _pause(2.0, 4.0)
+        # Scroll into view, click to focus
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", comment_box)
+        _pause(0.5, 1.0)
+        try:
+            ActionChains(driver).move_to_element(comment_box).click().perform()
+        except Exception:
+            comment_box.click()
+        _pause(0.8, 1.2)
+
+        # Type character-by-character using ActionChains (most reliable for React UI).
+        # This fires real keydown/keypress/keyup events that update React state.
+        actions = ActionChains(driver)
+        for char in comment_text:
+            actions.send_keys(char)
+        try:
+            actions.perform()
+        except Exception:
+            # Fallback: plain send_keys on the element
+            try:
+                comment_box.send_keys(comment_text)
+            except Exception:
+                pass
+
+        _pause(1.0, 2.0)
+
+        # After typing, React may have re-rendered — re-find the comment box
+        # before any further interaction (avoids StaleElementReferenceException).
+        fresh_box = None
+        for sel in [
+            "div[contenteditable='true'][aria-label*='comment' i]",
+            "div[contenteditable='true'][aria-placeholder*='comment' i]",
+            "textarea[placeholder*='Add a comment' i]",
+            "div[contenteditable='true']",
+            "form textarea",
+            "textarea",
+        ]:
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            if els:
+                fresh_box = els[0]
+                break
+
+        # Click the "Post" submit button (appears after text is entered in React UI)
+        posted = driver.execute_script("""
+            var btns = document.querySelectorAll('button, div[role="button"]');
+            for (var b of btns) {
+                var t = (b.textContent || b.innerText || '').trim().toLowerCase();
+                if (t === 'post') { b.click(); return 'post-btn'; }
+            }
+            return null;
+        """)
+
+        if posted:
+            log.info(f"[engagement] Submitted via: {posted}")
+        else:
+            # Fall back to Enter on whichever box reference is still valid
+            log.info("[engagement] No Post button found — using Enter key")
+            target = fresh_box or comment_box
+            try:
+                target.send_keys(Keys.RETURN)
+            except Exception:
+                pass
+
+        log.info(f"[engagement] Commented: {comment_text[:60]}")
+        _pause(2.5, 4.5)
         return True
 
     except Exception as exc:
-        log.debug(f"[engagement] Comment failed: {exc}")
+        log.warning(f"[engagement] Comment failed: {exc}", exc_info=True)
     return False
 
 
@@ -297,8 +385,10 @@ def _follow_current_author(driver) -> bool:
             log.info("[engagement] Followed post author")
             _pause(2.0, 4.0)
             return True
+        else:
+            log.info("[engagement] No 'Follow' button found (already following or not shown)")
     except Exception as exc:
-        log.debug(f"[engagement] Follow failed: {exc}")
+        log.warning(f"[engagement] Follow failed: {exc}")
     return False
 
 
@@ -389,18 +479,18 @@ def _engage_hashtag(
         if _like_current_post(driver):
             counts["likes"] += 1
 
-        # Comment (~50% chance per post, skip if over limit)
+        # Comment (~80% chance per post, skip if over limit)
         if (do_comment
                 and counts["comments"] < DAILY_COMMENT_LIMIT
-                and random.random() < 0.5):
+                and random.random() < 0.8):
             comment = _pick_comment(hashtag)
             if _comment_current_post(driver, comment):
                 counts["comments"] += 1
 
-        # Follow (~30% chance, skip if over limit)
+        # Follow (~40% chance, skip if over limit)
         if (do_follow
                 and counts["follows"] < DAILY_FOLLOW_LIMIT
-                and random.random() < 0.35):
+                and random.random() < 0.4):
             if _follow_current_author(driver):
                 counts["follows"] += 1
 
@@ -470,7 +560,7 @@ def run_post_engagement(cfg: dict, caption: str) -> None:
                   Third hashtag: like only (keep session light)
       Block 3 — Follow back 1–2 accounts that followed us (if username set)
     """
-    from instagram_bot import make_driver  # shared Chrome profile helpers
+    from art_bot import make_driver
 
     log.info("[engagement] Starting post-engagement session…")
     counts = _load_daily_counts()

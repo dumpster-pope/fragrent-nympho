@@ -21,3 +21,14 @@ _tmp_caption.txt
 
 # Screenshots saved by bot
 logs/*.png
+
+# Runtime data (generated at runtime, never commit)
+engagement_counts.json
+monitor_report.json
+
+# Improvement agent runtime files
+improvement/improvement_log.json
+improvement/improvement_state.json
+improvement/pending_proposals.json
+improvement.lock
+_improvement_sandbox/

@@ -1,57 +1,57 @@
 """
-AI Art Bot - Multi-Source Browser Automation
-Generates a 3-image series per hour by rotating across 7 AI image platforms:
-  - Grok (grok.com)          — Aurora model, strong painterly/surreal
-  - Leonardo.ai              — DreamShaper / Alchemy, rich fantasy/concept art
-  - Adobe Firefly            — Firefly model, photorealistic / fine-art painterly
-  - ChatGPT (chatgpt.com)    — DALL-E 3 via GPT-4o, versatile and descriptive
-  - Raphael.app              — fast high-quality generation, clean aesthetic
-  - Google Gemini            — Imagen 3, photorealistic and painterly
-Saves to Desktop/AI_Art/
-Run once per hour via Windows Task Scheduler (see setup_scheduler.ps1)
+AI Art Bot — Hourly Image Generator + Instagram Poster
+
+Each run:
+  1. Build a unique artistic prompt
+  2. Generate image via Grok (fallback: ChatGPT)
+  3. Save to Desktop/AI_Art/ with date, time, and prompt in the filename
+  4. Post to Instagram with date + time + prompt as the caption
+  5. Engage with 3-5 accounts (likes, comments, replies)
+  6. Stop until the next hour
+
+Run hourly via Windows Task Scheduler:
+  python art_bot.py run
+
+Manual login setup:
+  python art_bot.py login [grok|chatgpt|instagram]
 """
 
+import base64
+import json
+import logging
 import os
 import re
-import json
-import time
-import base64
 import random
-import logging
+import time
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
 import requests
 from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-SAVE_DIR = Path(r"C:\Users\gageg\Desktop\AI_Art")
-SAVE_DIR.mkdir(parents=True, exist_ok=True)
-
 BOT_DIR  = Path(__file__).parent
+SAVE_DIR = Path(r"C:\Users\gageg\Desktop\AI_Art")
 LOG_DIR  = BOT_DIR / "logs"
+
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
-CONFIG_FILE     = BOT_DIR / "config.json"
-SERIES_MANIFEST = BOT_DIR / "series_manifest.json"
+CONFIG_FILE  = BOT_DIR / "config.json"
+HISTORY_FILE = BOT_DIR / "prompt_history.json"
+LOCK_FILE    = BOT_DIR / "artbot.lock"
 
 # ── Source URLs ───────────────────────────────────────────────────────────────
-GROK_URL      = "https://grok.com"
-LEONARDO_URL  = "https://app.leonardo.ai/ai-generations"
-FIREFLY_URL   = "https://firefly.adobe.com/generate/images"
-EASEMATE_URL  = "https://www.easemate.ai/ai-image-generator"
-CHATGPT_URL   = "https://chatgpt.com/"
-RAPHAEL_URL   = "https://raphael.app/"
-GEMINI_URL    = "https://gemini.google.com/"
 
-# Equal weight rotation across all 6 sources (Bing removed — quality; EaseMate removed — broken)
-SOURCES = ["grok", "leonardo", "firefly", "chatgpt", "raphael", "gemini"]
+GROK_URL    = "https://grok.com"
+CHATGPT_URL = "https://chatgpt.com/"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -59,15 +59,17 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     handlers=[
-        logging.FileHandler(LOG_DIR / f"bot_{datetime.now().strftime('%Y%m%d')}.log",
-                            encoding="utf-8"),
+        logging.FileHandler(
+            LOG_DIR / f"bot_{datetime.now().strftime('%Y%m%d')}.log",
+            encoding="utf-8",
+        ),
         logging.StreamHandler(),
     ],
 )
 log = logging.getLogger("art_bot")
 
 
-# ── Prompt library ─────────────────────────────────────────────────────────────
+# ── Prompt library ────────────────────────────────────────────────────────────
 
 SUBJECTS = [
     # Architectural / structural
@@ -160,7 +162,6 @@ ENVIRONMENTS = [
 ]
 
 STYLES = [
-    # Painting traditions
     "in the style of a Studio Ghibli background painting, lush and atmospheric",
     "painted in heavy impasto oils with Baroque chiaroscuro and deep shadows",
     "rendered as a loose, luminous plein-air oil sketch",
@@ -172,7 +173,6 @@ STYLES = [
     "rendered as a richly layered Symbolist painting from the 1890s",
     "in the style of an N.C. Wyeth adventure illustration, dramatic and heroic",
     "painted as a Japanese nihonga on silk, gold leaf accents and soft gradients",
-    # Print and illustration
     "composed as a hyperdetailed Gustave Dore steel engraving",
     "created in the exact ligne claire style of Jean Giraud (Moebius)",
     "illustrated as a luminous Art Nouveau poster by Alphonse Mucha",
@@ -183,7 +183,6 @@ STYLES = [
     "drawn in precise cross-hatched ink in the tradition of Albrecht Durer",
     "illustrated as a full-page Victorian natural history plate",
     "depicted as a hand-screen-printed two-colour risograph illustration",
-    # Photography
     "shot on large-format film, rich tonal range and deep focus",
     "photographed on Kodachrome slide film, saturated and grain-heavy",
     "captured on medium-format black-and-white film with wide dynamic range",
@@ -191,7 +190,6 @@ STYLES = [
     "photographed with a long exposure at blue hour, light trails and stillness",
     "captured with a vintage Hasselblad on Tri-X pushed to 3200 ISO",
     "taken with a pinhole camera, soft and dreamlike with extreme depth of field",
-    # Mixed / craft
     "rendered as a hand-painted theatrical backdrop from a 1920s opera",
     "illustrated as a richly detailed medieval illuminated manuscript",
     "depicted as a stained-glass window in the High Gothic tradition",
@@ -231,7 +229,6 @@ COLOR_PALETTES = [
     "jewel palette of deep burgundy, forest green, and old gold",
 ]
 
-# Varied quality closers — no generic AI buzzwords
 CLOSERS = [
     "Fine detail throughout, strong sense of depth and atmosphere.",
     "Confident brushwork, rich surface texture, compelling composition.",
@@ -243,27 +240,9 @@ CLOSERS = [
     "Sweeping composition, dramatic contrast, immersive atmosphere.",
 ]
 
-# History file — tracks recent subject+style pairs to avoid repeats
-HISTORY_FILE = BOT_DIR / "prompt_history.json"
-HISTORY_SIZE = 80  # remember last 80 combos (35 subjects x 33 styles = 1155 total)
+HISTORY_SIZE = 80   # entries kept in prompt_history.json
 
-
-def _load_history() -> list:
-    if HISTORY_FILE.exists():
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f).get("used", [])
-        except Exception:
-            pass
-    return []
-
-
-def _save_history(used: list) -> None:
-    trimmed = used[-HISTORY_SIZE:]
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump({"used": trimmed}, f, indent=2)
-
-
+# Strip common lead-in phrases for clean caption display
 _DESCRIPTOR_PREFIXES = [
     r"^in the (exact |)style of\s+", r"^in the manner of\s+",
     r"^painted (in|as|on|with)\s+", r"^rendered as\s+",
@@ -279,138 +258,99 @@ _DESCRIPTOR_PREFIXES = [
 
 
 def _shorten_descriptor(text: str, max_len: int = 45) -> str:
-    """Strip common lead-in phrases and truncate at first comma for clean caption lines."""
     for p in _DESCRIPTOR_PREFIXES:
         text = re.sub(p, "", text, flags=re.IGNORECASE).strip()
     first_clause = re.split(r"[,.]", text)[0].strip()[:max_len]
     return first_clause[0].upper() + first_clause[1:] if first_clause else text[:max_len]
 
 
-def _weighted_choice(items: list, weights: list | None) -> str:
-    """Weighted random selection. Falls back to uniform if weights absent/mismatched."""
-    if not weights or len(weights) != len(items):
-        return random.choice(items)
-    total = sum(weights)
-    if total <= 0:
-        return random.choice(items)
-    r = random.uniform(0, total)
-    cumulative = 0.0
-    for item, w in zip(items, weights):
-        cumulative += w
-        if r <= cumulative:
-            return item
-    return items[-1]
+def _load_history() -> list:
+    """Load prompt history. Migrates old [subject, style] list entries to dicts."""
+    if HISTORY_FILE.exists():
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f).get("used", [])
+            migrated = []
+            for item in raw:
+                if isinstance(item, list):
+                    # Old format: [subject[:40], style[:40]]
+                    migrated.append({
+                        "subject":     item[0] if len(item) > 0 else "",
+                        "style":       item[1] if len(item) > 1 else "",
+                        "full_prompt": None,
+                    })
+                else:
+                    migrated.append(item)
+            return migrated
+        except Exception:
+            pass
+    return []
 
 
-def _build_variation_components(subject: str, env: str, n: int) -> list[dict]:
-    """
-    Generate N component dicts sharing the same subject+env, each with a unique
-    style and mood (no repeats within a series). Records each in prompt history.
-    """
-    weights: dict = {}
-    try:
-        import engagement_learner as _el
-        _data = _el.load_engagement_data()
-        weights = _el.get_all_weights(_data, {
-            "style":   STYLES,
-            "mood":    MOODS,
-            "palette": COLOR_PALETTES,
-            "closer":  CLOSERS,
-        })
-    except Exception:
-        pass
-
-    history = _load_history()
-    used_styles: set = set()
-    used_moods:  set = set()
-    variations:  list = []
-
-    for _ in range(n):
-        pool_s = [s for s in STYLES if s not in used_styles] or STYLES
-        w_s    = [weights.get("style", [1.0] * len(STYLES))[STYLES.index(s)]
-                  if s in STYLES else 1.0 for s in pool_s]
-        style  = _weighted_choice(pool_s, w_s)
-        used_styles.add(style)
-
-        pool_m = [m for m in MOODS if m not in used_moods] or MOODS
-        w_m    = [weights.get("mood", [1.0] * len(MOODS))[MOODS.index(m)]
-                  if m in MOODS else 1.0 for m in pool_m]
-        mood   = _weighted_choice(pool_m, w_m)
-        used_moods.add(mood)
-
-        palette = _weighted_choice(COLOR_PALETTES, weights.get("palette"))
-        closer  = _weighted_choice(CLOSERS,        weights.get("closer"))
-
-        variations.append({
-            "subject":     subject,
-            "environment": env,
-            "style":       style,
-            "mood":        mood,
-            "palette":     palette,
-            "closer":      closer,
-        })
-        history.append([subject[:40], style[:40]])
-
-    _save_history(history)
-    return variations
-
-
-def _build_variation_prompt(c: dict) -> str:
-    """Assemble the full prompt string from a variation component dict."""
-    return (
-        f"{c['subject'].capitalize()}, {c['environment']}. "
-        f"{c['style'].capitalize()}, {c['palette']}. "
-        f"{c['mood'].capitalize()}. {c['closer']}"
-    )
+def _save_history(used: list) -> None:
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump({"used": used[-HISTORY_SIZE:]}, f, indent=2)
 
 
 def build_prompt() -> tuple:
-    """
-    Build a unique prompt. Tracks recently used subject+style combinations
-    and avoids repeating them until the full library has been cycled through.
+    """Build a unique prompt. Returns (prompt_str, components_dict).
 
-    Returns (prompt_str, components_dict) where components_dict maps each
-    prompt component key to the exact value chosen (for engagement learning).
+    Primary path: Claude-powered agent (prompt_agent.py) — analyses the full
+    recent history and generates a completely fresh concept each run.
+    Fallback: random selection from the static lists below (original behaviour).
     """
-    # ── Load engagement weights (graceful fallback on any error) ──────────
-    weights: dict = {}
+    history = _load_history()
+
+    # ── Primary: Claude prompt agent ─────────────────────────────────────────
     try:
-        import engagement_learner as _el
-        _data = _el.load_engagement_data()
-        n_posts = len(_data.get("posts", {}))
-        weights = _el.get_all_weights(_data, {
-            "subject":     SUBJECTS,
-            "environment": ENVIRONMENTS,
-            "style":       STYLES,
-            "mood":        MOODS,
-            "palette":     COLOR_PALETTES,
-            "closer":      CLOSERS,
-        })
-        if n_posts >= _el.MIN_POSTS_FOR_LEARNING:
-            log.info(f"[engagement] loaded weights for {n_posts} posts")
+        from prompt_agent import generate_fresh_prompt
+        result = generate_fresh_prompt(history)
+        if result:
+            prompt_str, components = result
+            history.append({
+                # Full values for per-component cooldown tracking
+                "subject_full":     components.get("subject_full",     components.get("subject",     "")),
+                "environment_full": components.get("environment_full", components.get("environment", "")),
+                "style_full":       components.get("style_full",       components.get("style",       "")),
+                "mood_full":        components.get("mood_full",        components.get("mood",        "")),
+                "palette_full":     components.get("palette_full",     components.get("palette",     "")),
+                "closer_full":      components.get("closer_full",      components.get("closer",      "")),
+                # Category rotation metadata
+                "subject_category": components.get("subject_category", ""),
+                "style_medium":     components.get("style_medium",     ""),
+                "palette_temp":     components.get("palette_temp",     ""),
+                # Legacy / caption fields
+                "subject":          components.get("subject", "")[:60],
+                "style":            components.get("style",   "")[:60],
+                "full_prompt":      prompt_str,
+                "generated_at":     datetime.now().isoformat(),
+                "source":           "combinatorial",
+            })
+            _save_history(history)
+            return prompt_str, components
     except Exception as exc:
-        log.debug(f"[engagement] weight load skipped: {exc}")
+        log.warning(f"Prompt agent unavailable ({exc}) — using random fallback.")
 
-    history  = _load_history()
-    used_set = set(tuple(x) for x in history)
+    # ── Fallback: random selection from static lists ──────────────────────────
+    # Build a dedup set from whatever format is in history (old or new)
+    used_set = set()
+    for item in history:
+        if isinstance(item, dict):
+            used_set.add((item.get("subject", "")[:40], item.get("style", "")[:40]))
+        elif isinstance(item, list) and len(item) >= 2:
+            used_set.add((item[0], item[1]))
 
-    # Try up to 30 times to find a fresh subject+style pair
-    subject = style = env = mood = palette = closer = ""
+    subject = style = ""
     for _ in range(30):
-        subject = _weighted_choice(SUBJECTS,      weights.get("subject"))
-        style   = _weighted_choice(STYLES,        weights.get("style"))
-        key     = (subject[:40], style[:40])
-        if key not in used_set:
+        subject = random.choice(SUBJECTS)
+        style   = random.choice(STYLES)
+        if (subject[:40], style[:40]) not in used_set:
             break
 
-    env     = _weighted_choice(ENVIRONMENTS,  weights.get("environment"))
-    mood    = _weighted_choice(MOODS,         weights.get("mood"))
-    palette = _weighted_choice(COLOR_PALETTES, weights.get("palette"))
-    closer  = _weighted_choice(CLOSERS,       weights.get("closer"))
-
-    # Record this combination
-    history.append([subject[:40], style[:40]])
-    _save_history(history)
+    env     = random.choice(ENVIRONMENTS)
+    mood    = random.choice(MOODS)
+    palette = random.choice(COLOR_PALETTES)
+    closer  = random.choice(CLOSERS)
 
     prompt_str = (
         f"{subject.capitalize()}, {env}. "
@@ -418,13 +358,24 @@ def build_prompt() -> tuple:
         f"{mood.capitalize()}. {closer}"
     )
     components = {
-        "subject":     subject,
-        "environment": env,
-        "style":       style,
-        "mood":        mood,
-        "palette":     palette,
-        "closer":      closer,
+        "subject": subject, "environment": env, "style": style,
+        "mood": mood, "palette": palette, "closer": closer,
     }
+
+    history.append({
+        "subject_full":     subject,
+        "environment_full": env,
+        "style_full":       style,
+        "mood_full":        mood,
+        "palette_full":     palette,
+        "closer_full":      closer,
+        "subject":          subject[:60],
+        "style":            style[:60],
+        "full_prompt":      prompt_str,
+        "generated_at":     datetime.now().isoformat(),
+        "source":           "random_fallback",
+    })
+    _save_history(history)
     return prompt_str, components
 
 
@@ -435,9 +386,8 @@ def load_config() -> dict:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     cfg = {
-        "chrome_profile_path": "",
+        "chrome_profile_path": str(BOT_DIR / "chrome_profile"),
         "instagram_username": "",
-        "instagram_password": "",
         "last_run": None,
     }
     save_config(cfg)
@@ -452,41 +402,56 @@ def save_config(cfg: dict) -> None:
 # ── Selenium helpers ──────────────────────────────────────────────────────────
 
 def _clear_profile_locks(profile_dir: str) -> None:
-    """Recursively remove every Chrome lock file in the profile tree."""
+    """Delete Chrome lock files and kill any lingering Chrome processes using this profile."""
     root = Path(profile_dir)
-    for pattern in ("**/LOCK", "**/SingletonLock", "**/SingletonCookie", "**/SingletonSocket"):
-        for p in root.rglob(pattern.replace("**/", "")):
+
+    # Kill any Chrome processes still holding the bot's profile open
+    try:
+        import subprocess
+        profile_token = str(root).replace("\\", "\\\\")
+        ps = (
+            f"Get-Process chrome -ErrorAction SilentlyContinue | ForEach-Object {{"
+            f" $procId = $_.Id;"
+            f" try {{"
+            f"  $cmd = (Get-WmiObject Win32_Process -Filter \"ProcessId=$procId\" -EA SilentlyContinue).CommandLine;"
+            f"  if ($cmd -and $cmd -like '*AIArtBot*chrome_profile*') {{ $_ | Stop-Process -Force }}"
+            f" }} catch {{}} }}"
+        )
+        subprocess.run(["powershell", "-Command", ps], capture_output=True, timeout=10)
+        time.sleep(1)
+    except Exception:
+        pass
+
+    # Delete singleton/lock files
+    for pattern in ("LOCK", "SingletonLock", "SingletonCookie", "SingletonSocket"):
+        for p in root.rglob(pattern):
             try:
                 p.unlink()
-                log.debug(f"Removed lock: {p}")
             except Exception:
                 pass
 
 
-def make_driver(cfg: dict) -> webdriver.Chrome:
+def make_driver(cfg: dict, headless: bool = True) -> webdriver.Chrome:
     opts = Options()
-
     profile = cfg.get("chrome_profile_path", "").strip()
     if profile:
         Path(profile).mkdir(parents=True, exist_ok=True)
         _clear_profile_locks(profile)
         opts.add_argument(f"--user-data-dir={profile}")
-        log.info(f"Chrome profile: {profile}")
-    else:
-        log.info("No Chrome profile set — browser will open a fresh session")
-
-    # Anti-detection
+    if headless:
+        # Move off-screen instead of true headless — looks like normal Chrome to websites,
+        # but the window is invisible to the user (far off-screen, no taskbar focus).
+        opts.add_argument("--window-position=-10000,-10000")
+        opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument("--window-size=1400,960")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    # Stability — disable extensions so they don't crash the session
     opts.add_argument("--disable-extensions")
     opts.add_argument("--no-first-run")
     opts.add_argument("--no-default-browser-check")
-
     driver = webdriver.Chrome(options=opts)
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
@@ -496,46 +461,45 @@ def make_driver(cfg: dict) -> webdriver.Chrome:
 
 
 def slow_type(element, text: str) -> None:
-    """Type text with small random pauses to look human."""
     for ch in text:
         element.send_keys(ch)
         if random.random() < 0.04:
             time.sleep(random.uniform(0.04, 0.18))
 
 
-def find_first(driver, selectors: list[tuple], timeout: int = 15):
-    """Try multiple (By, selector) pairs and return the first element found."""
+def find_first(driver, selectors: list, timeout: int = 15):
     for by, sel in selectors:
         try:
             el = WebDriverWait(driver, timeout).until(
                 EC.element_to_be_clickable((by, sel))
             )
-            log.debug(f"Found element: {sel}")
             return el
         except Exception:
             pass
     return None
 
 
-# ── Image download ────────────────────────────────────────────────────────────
+def _screenshot(driver, label: str) -> None:
+    try:
+        driver.save_screenshot(
+            str(LOG_DIR / f"{label}_{datetime.now().strftime('%H%M%S')}.png")
+        )
+    except Exception:
+        pass
 
-def download_image(driver, img_url: str, prompt: str,
-                   referer: str = GROK_URL, source_name: str = "grok",
-                   components: dict | None = None) -> str | None:
-    """Download image (HTTP or blob:) and save to SAVE_DIR. Returns filepath."""
-    now  = datetime.now()
-    slug = re.sub(r"\W+", "_", prompt[:45]).strip("_")
-    if components and components.get("series_id"):
-        filename = f"{components['series_id']}_S{components.get('series_idx', 1)}_{slug}.png"
-    else:
-        filename = f"{now.strftime('%Y%m%d_%H%M%S')}_{slug}.png"
+
+# ── Image saving ──────────────────────────────────────────────────────────────
+
+def _save_image(driver, img_url: str, prompt: str, source: str, components: dict) -> str | None:
+    """Download image and save to SAVE_DIR. Returns filepath or None."""
+    now      = datetime.now()
+    slug     = re.sub(r"\W+", "_", prompt[:45]).strip("_")
+    filename = f"{now.strftime('%Y%m%d_%H%M%S')}_{slug}.png"
     filepath = SAVE_DIR / filename
 
     try:
         if img_url.startswith("blob:"):
-            log.info("Extracting blob image via canvas…")
-            b64 = driver.execute_script(
-                """
+            b64 = driver.execute_script("""
                 var img = document.querySelector("img[src='" + arguments[0] + "']");
                 if (!img) return null;
                 var c = document.createElement('canvas');
@@ -543,216 +507,59 @@ def download_image(driver, img_url: str, prompt: str,
                 c.height = img.naturalHeight || 1024;
                 c.getContext('2d').drawImage(img, 0, 0);
                 return c.toDataURL('image/png').split(',')[1];
-                """,
-                img_url,
-            )
+            """, img_url)
             if not b64:
                 log.error("Canvas extraction returned nothing")
                 return None
             with open(filepath, "wb") as f:
                 f.write(base64.b64decode(b64))
-
         else:
-            # Transfer cookies from Selenium session so auth'd CDN URLs work
             session = requests.Session()
             for ck in driver.get_cookies():
                 session.cookies.set(ck["name"], ck["value"])
-            ua = driver.execute_script("return navigator.userAgent;")
+            ua   = driver.execute_script("return navigator.userAgent;")
             resp = session.get(
                 img_url,
-                headers={"User-Agent": ua, "Referer": referer},
+                headers={"User-Agent": ua, "Referer": GROK_URL},
                 timeout=30,
             )
             resp.raise_for_status()
             with open(filepath, "wb") as f:
                 f.write(resp.content)
-            log.info(f"Downloaded {len(resp.content)//1024} KB")
 
-        # Sanity-check: skip tiny/corrupt files
         size_kb = filepath.stat().st_size // 1024
         if size_kb < 30:
             log.warning(f"File too small ({size_kb} KB) — likely not a real image, discarding")
             filepath.unlink(missing_ok=True)
             return None
 
-        log.info(f"Image saved → {filepath}")
-        _save_sidecar(filepath, prompt, img_url, source_name, components)
+        # Write sidecar JSON so caption builder can read structured data
+        meta = {
+            "generated_at": now.isoformat(),
+            "prompt":       prompt,
+            "source":       source,
+            "components":   components,
+        }
+        filepath.with_name(filepath.stem + "_meta.json").write_text(
+            json.dumps(meta, indent=2), encoding="utf-8"
+        )
+
+        log.info(f"Saved → {filepath.name}  ({size_kb} KB)")
         return str(filepath)
 
     except Exception as exc:
-        log.error(f"Download failed: {exc}")
+        log.error(f"Image save failed: {exc}")
+        filepath.unlink(missing_ok=True)
         return None
 
-
-def _save_sidecar(filepath, prompt: str, url: str, source_name: str = "grok",
-                  components: dict | None = None) -> None:
-    meta = {
-        "generated_at": datetime.now().isoformat(),
-        "prompt": prompt,
-        "source": url[:200],
-        "source_name": source_name,
-        "file": str(filepath),
-    }
-    if components:
-        meta["components"] = components
-    sidecar = Path(str(filepath).replace(".png", "_meta.json"))
-    with open(sidecar, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-
-
-# ── Core generation logic ─────────────────────────────────────────────────────
-
-def generate_image(prompt: str, cfg: dict, components: dict | None = None) -> str | None:
-    """
-    Open Grok in Chrome, submit the image-generation prompt,
-    wait for the result image, download it. Returns saved filepath or None.
-    """
-    driver = make_driver(cfg)
-    try:
-        log.info("Loading grok.com…")
-        driver.get(GROK_URL)
-        time.sleep(4)
-
-        # ── 1. Find the text input ─────────────────────────────────────────
-        input_el = find_first(driver, [
-            (By.CSS_SELECTOR, "textarea"),
-            (By.CSS_SELECTOR, "div[contenteditable='true']"),
-            (By.XPATH, "//textarea[@placeholder]"),
-            (By.CSS_SELECTOR, "div[role='textbox']"),
-        ])
-        if input_el is None:
-            log.error("Could not find chat input — is the page loaded correctly?")
-            _screenshot(driver, "no_input")
-            return None
-
-        # ── 2. Click the image-generation mode button if present ───────────
-        img_mode_btns = [
-            (By.XPATH, "//button[contains(translate(., 'IMAGE', 'image'), 'image')]"),
-            (By.CSS_SELECTOR, "button[aria-label*='mage']"),
-            (By.XPATH, "//*[contains(@aria-label,'Generate image') or contains(@aria-label,'Image')]"),
-            (By.CSS_SELECTOR, "[data-testid*='image']"),
-        ]
-        for by, sel in img_mode_btns:
-            try:
-                btn = driver.find_element(by, sel)
-                driver.execute_script("arguments[0].click();", btn)
-                log.info(f"Clicked image mode: {sel}")
-                time.sleep(1.5)
-                break
-            except Exception:
-                pass
-
-        # ── 3. Type the prompt ─────────────────────────────────────────────
-        input_el.click()
-        time.sleep(0.5)
-        try:
-            input_el.clear()
-        except Exception:
-            pass
-        slow_type(input_el, prompt)
-        time.sleep(1)
-
-        # ── 4. Submit ──────────────────────────────────────────────────────
-        submit_el = find_first(driver, [
-            (By.CSS_SELECTOR, "button[type='submit']"),
-            (By.XPATH, "//button[@aria-label='Submit message']"),
-            (By.XPATH, "//button[@aria-label='Send message']"),
-            (By.CSS_SELECTOR, "[data-testid='send-button']"),
-        ], timeout=5)
-
-        if submit_el:
-            driver.execute_script("arguments[0].click();", submit_el)
-            log.info("Submitted via button")
-        else:
-            input_el.send_keys(Keys.RETURN)
-            log.info("Submitted via Enter")
-
-        # ── 5. Wait for the generated image ───────────────────────────────
-        # Give Grok at least 15 s to start generating before we start polling
-        log.info("Waiting for Grok to generate image (up to 180 s)…")
-        time.sleep(15)
-
-        start_time = time.time()
-        deadline = start_time + 165  # 15 + 165 = 180 s total
-        found_url: str | None = None
-
-        while time.time() < deadline:
-            time.sleep(3)
-            try:
-                # Use JS to find all large images on the page at once
-                result = driver.execute_script("""
-                    var candidates = [];
-                    var imgs = document.querySelectorAll('img');
-                    for (var i = 0; i < imgs.length; i++) {
-                        var img = imgs[i];
-                        var src = img.src || '';
-                        var w = img.naturalWidth;
-                        var h = img.naturalHeight;
-                        if (w >= 512 && h >= 512) {
-                            candidates.push({src: src, w: w, h: h});
-                        }
-                    }
-                    return candidates;
-                """)
-
-                if result:
-                    for item in result:
-                        src = item.get('src', '')
-                        w   = item.get('w', 0)
-                        h   = item.get('h', 0)
-                        # Skip profile pictures (usually square, hosted on pbs.twimg.com profile paths)
-                        if 'profile_images' in src:
-                            continue
-                        # Prefer known Grok image CDN domains
-                        if any(k in src for k in ('grokusercontent', 'assets.grok.com', 'blob:', 'pbs.twimg')):
-                            found_url = src
-                            log.info(f"Generated image found ({w}x{h}): {src[:100]}")
-                            break
-                        # Fallback: any 512+ image that isn't a profile pic
-                        if w >= 512:
-                            found_url = src
-                            log.info(f"Large image found ({w}x{h}): {src[:100]}")
-
-                if found_url:
-                    break
-
-            except Exception as exc:
-                log.debug(f"Poll error: {exc}")
-
-            elapsed = int(time.time() - start_time) + 15
-            if elapsed % 30 == 0:
-                log.info(f"  still waiting… ({elapsed}s)")
-                _screenshot(driver, f"progress_{elapsed}s")
-
-        if not found_url:
-            log.error("No image found within 120 s")
-            _screenshot(driver, "timeout")
-            return None
-
-        # ── 6. Download ────────────────────────────────────────────────────
-        return download_image(driver, found_url, prompt, components=components)
-
-    except Exception as exc:
-        log.exception(f"Unexpected error: {exc}")
-        _screenshot(driver, "exception")
-        return None
-
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-
-
-# ── Shared image-detection helper ─────────────────────────────────────────────
 
 def _wait_for_large_image(driver, timeout: int, cdn_hints: list) -> str | None:
-    """Poll for any 512px+ image matching a CDN hint, fall back to any large img."""
+    """Poll for a 512px+ image matching a CDN hint, fall back to any large image."""
     start = time.time()
     while time.time() - start < timeout:
         result = driver.execute_script("""
-            var hints = arguments[0];
-            var imgs  = document.querySelectorAll('img');
+            var hints    = arguments[0];
+            var imgs     = document.querySelectorAll('img');
             var fallback = null;
             for (var i = 0; i < imgs.length; i++) {
                 var src = imgs[i].src || '';
@@ -768,320 +575,162 @@ def _wait_for_large_image(driver, timeout: int, cdn_hints: list) -> str | None:
             return fallback;
         """, cdn_hints)
         if result:
-            log.info(f"  image detected ({result['w']}x{result['h']}): {result['src'][:80]}")
+            log.info(f"Image detected ({result['w']}x{result['h']}): {result['src'][:80]}")
             return result["src"]
         time.sleep(4)
     return None
 
 
-# ── Leonardo.ai generator ─────────────────────────────────────────────────────
+# ── Grok generator ────────────────────────────────────────────────────────────
 
-def generate_via_leonardo(driver, prompt: str) -> str | None:
-    """Submit a prompt to Leonardo.ai and return the generated image URL."""
-    log.info("Leonardo.ai: loading AI Generations page…")
-    driver.get(LEONARDO_URL)
-    time.sleep(8)  # Heavy React app
-
-    textarea = find_first(driver, [
-        (By.CSS_SELECTOR, "textarea[placeholder*='Type a prompt' i]"),
-        (By.CSS_SELECTOR, "textarea[placeholder*='prompt' i]"),
-        (By.CSS_SELECTOR, "textarea"),
-    ], timeout=20)
-    if not textarea:
-        log.error("Leonardo: prompt textarea not found")
-        return None
-
-    textarea.click()
-    time.sleep(0.5)
-    try:
-        textarea.clear()
-    except Exception:
-        pass
-    slow_type(textarea, prompt[:480])
-    time.sleep(1)
-
-    # ── Set image count to 2 to preserve daily tokens ─────────────────────
-    try:
-        count_btn = driver.find_element(
-            By.XPATH,
-            "(//label[contains(translate(.,'NUMBER OF IMAGES','number of images'),'number of images')]"
-            "/following::button[normalize-space()='2']"
-            "| //button[@data-testid='image-count-2']"
-            "| //button[@aria-label='2 images'])[1]",
-        )
-        driver.execute_script("arguments[0].click();", count_btn)
-        log.info("Leonardo: image count set to 2")
-        time.sleep(0.5)
-    except Exception:
-        log.debug("Leonardo: image count selector not found — using default")
-
-    gen_btn = find_first(driver, [
-        (By.XPATH, "//button[normalize-space()='Generate']"),
-        (By.CSS_SELECTOR, "button[aria-label*='Generate' i]"),
-        (By.XPATH, "//button[contains(@data-testid,'generate')]"),
-    ], timeout=12)
-    if not gen_btn:
-        log.error("Leonardo: Generate button not found")
-        return None
-
-    driver.execute_script("arguments[0].click();", gen_btn)
-    log.info("Leonardo: generating… (up to 120 s)")
-    time.sleep(12)
-
-    return _wait_for_large_image(driver, timeout=108, cdn_hints=[
-        "cdn.leonardo.ai", "production.leonardo.ai", "storage.googleapis.com",
-    ])
-
-
-# ── Adobe Firefly generator ───────────────────────────────────────────────────
-
-def generate_via_firefly(driver, prompt: str) -> str | None:
-    """Submit a prompt to Adobe Firefly and return the generated image URL."""
-    log.info("Adobe Firefly: loading…")
-    driver.get(FIREFLY_URL)
-    time.sleep(6)
-
-    prompt_el = find_first(driver, [
-        (By.CSS_SELECTOR, "textarea[placeholder*='Describe' i]"),
-        (By.CSS_SELECTOR, "textarea[placeholder*='image' i]"),
-        (By.CSS_SELECTOR, "textarea"),
-        (By.CSS_SELECTOR, "div[contenteditable='true']"),
-    ], timeout=20)
-    if not prompt_el:
-        log.error("Firefly: prompt input not found")
-        return None
-
-    prompt_el.click()
-    time.sleep(0.5)
-    try:
-        prompt_el.clear()
-    except Exception:
-        pass
-    slow_type(prompt_el, prompt[:480])
-    time.sleep(1)
-
-    gen_btn = find_first(driver, [
-        (By.XPATH, "//button[normalize-space()='Generate']"),
-        (By.CSS_SELECTOR, "button[data-testid*='generate' i]"),
-        (By.XPATH, "//button[contains(@aria-label,'Generate')]"),
-    ], timeout=12)
-    if not gen_btn:
-        log.error("Firefly: Generate button not found")
-        return None
-
-    driver.execute_script("arguments[0].click();", gen_btn)
-    log.info("Firefly: generating… (up to 90 s)")
-    time.sleep(10)
-
-    return _wait_for_large_image(driver, timeout=80, cdn_hints=[
-        "firefly.adobe.com", "ffoutput", "adobeproductimages", "firefly-prod",
-    ])
-
-
-# ── Bing Image Creator (DALL-E 3) generator ───────────────────────────────────
-
-def generate_via_bing(driver, prompt: str) -> str | None:
-    """Submit a prompt to Bing Image Creator (DALL-E 3) and return the image URL."""
-    log.info("Bing Image Creator: loading…")
-    driver.get(BING_URL)
+def _generate_via_grok(driver, prompt: str) -> str | None:
+    log.info("Grok: loading grok.com…")
+    driver.get(GROK_URL)
     time.sleep(4)
 
-    prompt_el = find_first(driver, [
-        (By.CSS_SELECTOR, "#sb_form_q"),
-        (By.CSS_SELECTOR, "input.b_searchbox"),
-        (By.CSS_SELECTOR, "textarea.b_searchbox"),
-        (By.CSS_SELECTOR, "input[name='q']"),
-    ], timeout=15)
-    if not prompt_el:
-        log.error("Bing: prompt input not found")
+    input_el = find_first(driver, [
+        (By.CSS_SELECTOR, "textarea"),
+        (By.CSS_SELECTOR, "div[contenteditable='true']"),
+        (By.CSS_SELECTOR, "div[role='textbox']"),
+    ])
+    if not input_el:
+        log.error("Grok: chat input not found")
+        _screenshot(driver, "grok_no_input")
         return None
 
-    prompt_el.click()
-    time.sleep(0.3)
-    prompt_el.clear()
-    prompt_el.send_keys(prompt[:480])
-    time.sleep(1)
-
-    # Try the dedicated Create button first; fall back to Enter
-    create_btn = find_first(driver, [
-        (By.CSS_SELECTOR, "#create_btn_c"),
-        (By.CSS_SELECTOR, "input.create_btn"),
-        (By.XPATH, "//input[@value='Create' or @value='Generate']"),
-        (By.XPATH, "//button[normalize-space()='Create']"),
-    ], timeout=8)
-    if create_btn:
-        driver.execute_script("arguments[0].click();", create_btn)
-    else:
-        prompt_el.send_keys(Keys.RETURN)
-
-    log.info("Bing: generating… (up to 90 s, includes page redirect)")
-    time.sleep(14)
-
-    return _wait_for_large_image(driver, timeout=76, cdn_hints=[
-        "th.bing.com", "tse1.mm.bing.net", "tse2.mm.bing.net", "blob:",
-    ])
-
-
-# ── EaseMate.ai generator (Nano Banana model) ─────────────────────────────────
-
-def generate_via_easemate(driver, prompt: str) -> str | None:
-    """Submit a prompt to EaseMate.ai using the Nano Banana model and return the image URL."""
-    log.info("EaseMate.ai: loading AI image generator…")
-    driver.get(EASEMATE_URL)
-    time.sleep(6)
-
-    # ── 1. Switch to Text-to-Image tab if tabs are present ────────────────
+    # Click image-generation mode button if visible
     for by, sel in [
-        (By.XPATH, "//button[contains(translate(.,'TEXT TO IMAGE','text to image'),'text to image')]"),
-        (By.XPATH, "//div[contains(translate(.,'TEXT TO IMAGE','text to image'),'text to image')]"),
-        (By.CSS_SELECTOR, "[data-tab='text']"),
+        (By.XPATH, "//button[contains(translate(., 'IMAGE', 'image'), 'image')]"),
+        (By.CSS_SELECTOR, "button[aria-label*='mage']"),
+        (By.XPATH, "//*[contains(@aria-label,'Generate image') or contains(@aria-label,'Image')]"),
     ]:
         try:
-            tab = driver.find_element(by, sel)
-            driver.execute_script("arguments[0].click();", tab)
-            log.info("EaseMate: switched to Text to Image tab")
-            time.sleep(2)
+            btn = driver.find_element(by, sel)
+            driver.execute_script("arguments[0].click();", btn)
+            log.info("Grok: clicked image mode")
+            time.sleep(1.5)
             break
         except Exception:
             pass
 
-    # ── 2. Select the Nano Banana model ───────────────────────────────────
-    model_selected = False
-
-    # First try: click a visible model selector button / dropdown trigger
-    model_trigger_selectors = [
-        (By.XPATH, "//button[contains(translate(.,'MODEL','model'),'model')]"),
-        (By.CSS_SELECTOR, "[class*='model'][class*='select'], [class*='model-selector']"),
-        (By.CSS_SELECTOR, "select[name*='model' i], select[id*='model' i]"),
-        (By.XPATH, "//*[contains(@aria-label,'model') or contains(@placeholder,'model')]"),
-        (By.XPATH, "//button[contains(.,'GPT') or contains(.,'Model') or contains(.,'model')]"),
-        (By.CSS_SELECTOR, "[class*='dropdown'][class*='model'], [data-type='model']"),
-    ]
-
-    for by, sel in model_trigger_selectors:
+    # Wait up to 45s for Turnstile overlay to resolve; try clicking its checkbox each second
+    for _t in range(45):
         try:
-            el = driver.find_element(by, sel)
-            driver.execute_script("arguments[0].click();", el)
-            log.info(f"EaseMate: opened model selector ({sel})")
-            time.sleep(2)
-
-            # Look for Nano Banana option in dropdown
-            nano_option = find_first(driver, [
-                (By.XPATH, "//*[contains(translate(.,'NANO BANANA','nano banana'),'nano banana')]"),
-                (By.XPATH, "//li[contains(translate(.,'NANO BANANA','nano banana'),'nano banana')]"),
-                (By.XPATH, "//option[contains(translate(.,'NANO BANANA','nano banana'),'nano banana')]"),
-                (By.CSS_SELECTOR, "[data-value*='nano' i], [data-value*='banana' i]"),
-            ], timeout=5)
-
-            if nano_option:
-                driver.execute_script("arguments[0].click();", nano_option)
-                log.info("EaseMate: selected Nano Banana model")
-                time.sleep(1.5)
-                model_selected = True
-                break
+            overlay = driver.find_element(By.ID, "turnstile-widget")
+            if overlay.is_displayed():
+                if _t == 0:
+                    log.info("Grok: Turnstile detected — attempting checkbox click…")
+                try:
+                    iframe = overlay.find_element(By.TAG_NAME, "iframe")
+                    driver.switch_to.frame(iframe)
+                    cb = driver.find_element(By.CSS_SELECTOR, "input[type='checkbox']")
+                    driver.execute_script("arguments[0].click();", cb)
+                    driver.switch_to.default_content()
+                    log.info("Grok: Turnstile checkbox clicked — waiting to clear…")
+                    time.sleep(3)
+                except Exception:
+                    driver.switch_to.default_content()
+                    time.sleep(1)
+                continue
         except Exception:
             pass
+        break
+    else:
+        log.warning("Grok: Turnstile still present after 45s — proceeding anyway")
 
-    # Second try: if it's a <select> element, set value directly
-    if not model_selected:
-        try:
-            from selenium.webdriver.support.ui import Select
-            selects = driver.find_elements(By.CSS_SELECTOR, "select")
-            for sel_el in selects:
-                opts = sel_el.find_elements(By.TAG_NAME, "option")
-                for opt in opts:
-                    if "nano" in opt.text.lower() or "banana" in opt.text.lower():
-                        Select(sel_el).select_by_visible_text(opt.text)
-                        log.info(f"EaseMate: selected Nano Banana via <select> ({opt.text})")
-                        time.sleep(1)
-                        model_selected = True
-                        break
-                if model_selected:
-                    break
-        except Exception:
-            pass
-
-    # Third try: JS-click any element whose text contains nano/banana
-    if not model_selected:
-        try:
-            found = driver.execute_script("""
-                var els = document.querySelectorAll('*');
-                for (var i = 0; i < els.length; i++) {
-                    var t = els[i].textContent.toLowerCase();
-                    if (t.includes('nano banana') || (t.includes('nano') && t.includes('banana'))) {
-                        return els[i];
-                    }
-                }
-                return null;
-            """)
-            if found:
-                driver.execute_script("arguments[0].click();", found)
-                log.info("EaseMate: selected Nano Banana via JS text search")
-                time.sleep(1.5)
-                model_selected = True
-        except Exception:
-            pass
-
-    if not model_selected:
-        log.warning("EaseMate: could not find Nano Banana model — proceeding with current model")
-
-    # ── 3. Enter the prompt ────────────────────────────────────────────────
-    prompt_el = find_first(driver, [
-        (By.CSS_SELECTOR, "textarea[placeholder*='Prompt' i]"),
-        (By.CSS_SELECTOR, "textarea[placeholder*='Describe' i]"),
-        (By.CSS_SELECTOR, "textarea[placeholder*='Enter' i]"),
-        (By.CSS_SELECTOR, "textarea"),
-        (By.CSS_SELECTOR, "div[contenteditable='true']"),
-        (By.CSS_SELECTOR, "input[placeholder*='prompt' i]"),
-    ], timeout=15)
-
-    if not prompt_el:
-        log.error("EaseMate: prompt input not found")
-        _screenshot(driver, "easemate_no_input")
-        return None
-
-    prompt_el.click()
+    driver.execute_script("arguments[0].scrollIntoView(true);", input_el)
+    driver.execute_script("arguments[0].click();", input_el)
     time.sleep(0.5)
     try:
-        prompt_el.clear()
+        input_el.clear()
     except Exception:
         pass
-    slow_type(prompt_el, prompt[:480])
+    slow_type(input_el, prompt)
     time.sleep(1)
 
-    # ── 4. Click Generate ──────────────────────────────────────────────────
-    gen_btn = find_first(driver, [
-        (By.XPATH, "//button[normalize-space()='Generate']"),
-        (By.XPATH, "//button[contains(normalize-space(),'Generate')]"),
+    submit_el = find_first(driver, [
         (By.CSS_SELECTOR, "button[type='submit']"),
-        (By.CSS_SELECTOR, "[class*='generate'][class*='btn'], [class*='btn'][class*='generate']"),
-        (By.CSS_SELECTOR, "button[aria-label*='Generate' i]"),
-    ], timeout=12)
+        (By.XPATH, "//button[@aria-label='Submit message']"),
+        (By.XPATH, "//button[@aria-label='Send message']"),
+        (By.CSS_SELECTOR, "[data-testid='send-button']"),
+    ], timeout=5)
+    if submit_el:
+        driver.execute_script("arguments[0].click();", submit_el)
+        log.info("Grok: submitted via button")
+    else:
+        input_el.send_keys(Keys.RETURN)
+        log.info("Grok: submitted via Enter")
 
-    if not gen_btn:
-        log.error("EaseMate: Generate button not found")
-        _screenshot(driver, "easemate_no_button")
-        return None
+    log.info("Grok: waiting for image (up to 180 s)…")
+    time.sleep(15)
 
-    driver.execute_script("arguments[0].click();", gen_btn)
-    log.info("EaseMate: generating… (up to 120 s)")
-    time.sleep(12)
+    start    = time.time()
+    deadline = start + 165
+    found_url = None
 
-    # ── 5. Wait for the generated image ───────────────────────────────────
-    return _wait_for_large_image(driver, timeout=108, cdn_hints=[
-        "easemate.ai", "easemate", "cdn.", "storage.", "output", "result",
-    ])
+    while time.time() < deadline:
+        time.sleep(3)
+        # Detect mid-generation Turnstile and try to click the checkbox inside its iframe
+        try:
+            overlay = driver.find_element(By.ID, "turnstile-widget")
+            if overlay.is_displayed():
+                try:
+                    iframe = overlay.find_element(By.TAG_NAME, "iframe")
+                    driver.switch_to.frame(iframe)
+                    cb = driver.find_element(By.CSS_SELECTOR, "input[type='checkbox']")
+                    driver.execute_script("arguments[0].click();", cb)
+                    driver.switch_to.default_content()
+                    log.info("Grok: clicked Turnstile checkbox — waiting to resolve…")
+                    time.sleep(5)
+                except Exception:
+                    driver.switch_to.default_content()
+                continue
+        except Exception:
+            pass
+        try:
+            result = driver.execute_script("""
+                var imgs = document.querySelectorAll('img');
+                var candidates = [];
+                for (var i = 0; i < imgs.length; i++) {
+                    var src = imgs[i].src || '';
+                    var w   = imgs[i].naturalWidth;
+                    var h   = imgs[i].naturalHeight;
+                    if (w >= 512 && h >= 512 && src.indexOf('profile_images') === -1) {
+                        candidates.push({src: src, w: w, h: h});
+                    }
+                }
+                return candidates;
+            """)
+            if result:
+                for item in result:
+                    src = item.get("src", "")
+                    if any(k in src for k in ("grokusercontent", "assets.grok.com", "blob:", "pbs.twimg", "grok.com")):
+                        found_url = src
+                        log.info(f"Grok: image found ({item['w']}x{item['h']}): {src[:80]}")
+                        break
+                if found_url:
+                    break
+        except Exception as exc:
+            log.debug(f"Grok poll: {exc}")
+
+        elapsed = int(time.time() - start) + 15
+        if elapsed % 30 == 0:
+            log.info(f"  Grok: still waiting… ({elapsed}s)")
+            _screenshot(driver, f"grok_wait_{elapsed}s")
+
+    if not found_url:
+        log.error("Grok: no image found within 180 s")
+        _screenshot(driver, "grok_timeout")
+    return found_url
 
 
-# ── ChatGPT / DALL-E 3 generator ──────────────────────────────────────────────
+# ── ChatGPT generator ─────────────────────────────────────────────────────────
 
-def generate_via_chatgpt(driver, prompt: str) -> str | None:
-    """Submit a prompt to ChatGPT and return the DALL-E 3 generated image URL."""
-    log.info("ChatGPT: loading…")
+def _generate_via_chatgpt(driver, prompt: str) -> str | None:
+    log.info("ChatGPT: loading chatgpt.com…")
     driver.get(CHATGPT_URL)
     time.sleep(6)
 
-    # ── 1. Find the chat input ─────────────────────────────────────────────
     prompt_el = find_first(driver, [
         (By.CSS_SELECTOR, "#prompt-textarea"),
         (By.CSS_SELECTOR, "div[contenteditable='true'][data-lexical-editor]"),
@@ -1092,13 +741,11 @@ def generate_via_chatgpt(driver, prompt: str) -> str | None:
         log.error("ChatGPT: prompt input not found")
         return None
 
-    # ── 2. Type the prompt, prefixed to trigger DALL-E image generation ────
     prompt_el.click()
     time.sleep(0.5)
     slow_type(prompt_el, f"Generate an image: {prompt[:450]}")
     time.sleep(1)
 
-    # ── 3. Submit ──────────────────────────────────────────────────────────
     submit_el = find_first(driver, [
         (By.CSS_SELECTOR, "button[data-testid='send-button']"),
         (By.CSS_SELECTOR, "button[aria-label='Send prompt']"),
@@ -1108,7 +755,8 @@ def generate_via_chatgpt(driver, prompt: str) -> str | None:
         driver.execute_script("arguments[0].click();", submit_el)
     else:
         prompt_el.send_keys(Keys.RETURN)
-    log.info("ChatGPT: generating… (up to 120 s)")
+
+    log.info("ChatGPT: waiting for image (up to 120 s)…")
     time.sleep(15)
 
     return _wait_for_large_image(driver, timeout=105, cdn_hints=[
@@ -1116,443 +764,225 @@ def generate_via_chatgpt(driver, prompt: str) -> str | None:
     ])
 
 
-# ── Raphael.app generator ─────────────────────────────────────────────────────
+# ── Pollinations generator ────────────────────────────────────────────────────
 
-def generate_via_raphael(driver, prompt: str) -> str | None:
-    """Submit a prompt to Raphael.app and return the generated image URL."""
-    log.info("Raphael: loading…")
-    driver.get(RAPHAEL_URL)
-    time.sleep(5)
-
-    # ── 1. Find the prompt input ───────────────────────────────────────────
-    prompt_el = find_first(driver, [
-        (By.CSS_SELECTOR, "textarea[placeholder*='Describe' i]"),
-        (By.CSS_SELECTOR, "textarea[placeholder*='Enter' i]"),
-        (By.CSS_SELECTOR, "textarea[placeholder*='prompt' i]"),
-        (By.CSS_SELECTOR, "input[placeholder*='prompt' i]"),
-        (By.CSS_SELECTOR, "textarea"),
-    ], timeout=15)
-    if not prompt_el:
-        log.error("Raphael: prompt input not found")
-        return None
-
-    prompt_el.click()
-    time.sleep(0.5)
+def _generate_via_pollinations(driver, prompt: str) -> str | None:
+    """Download image from Pollinations.ai directly and save it. Returns 'SAVED:<path>' or None."""
+    encoded = urllib.parse.quote(prompt[:500], safe="")
+    url = (
+        f"https://image.pollinations.ai/prompt/{encoded}"
+        f"?width=1024&height=1024&nologo=true&enhance=true&model=flux"
+        f"&seed={random.randint(1, 999999)}"
+    )
+    log.info("Pollinations: requesting image…")
     try:
-        prompt_el.clear()
-    except Exception:
-        pass
-    slow_type(prompt_el, prompt[:480])
-    time.sleep(1)
-
-    # ── 2. Click Generate ──────────────────────────────────────────────────
-    gen_btn = find_first(driver, [
-        (By.XPATH, "//button[normalize-space()='Generate']"),
-        (By.XPATH, "//button[contains(normalize-space(),'Generate')]"),
-        (By.CSS_SELECTOR, "button[type='submit']"),
-        (By.CSS_SELECTOR, "[class*='generate'][class*='btn'], [class*='btn'][class*='generate']"),
-    ], timeout=12)
-    if not gen_btn:
-        log.error("Raphael: Generate button not found")
-        return None
-
-    driver.execute_script("arguments[0].click();", gen_btn)
-    log.info("Raphael: generating… (up to 120 s)")
-    time.sleep(10)
-
-    return _wait_for_large_image(driver, timeout=110, cdn_hints=[
-        "raphael.app", "cdn.raphael", "storage", "output", "result",
-    ])
-
-
-# ── Google Gemini / Imagen generator ─────────────────────────────────────────
-
-def generate_via_gemini(driver, prompt: str) -> str | None:
-    """Submit a prompt to Google Gemini and return the Imagen-generated image URL."""
-    log.info("Gemini: loading…")
-    driver.get(GEMINI_URL)
-    time.sleep(6)
-
-    # ── 1. Find the chat input ─────────────────────────────────────────────
-    prompt_el = find_first(driver, [
-        (By.CSS_SELECTOR, "div[contenteditable='true']"),
-        (By.CSS_SELECTOR, "rich-textarea div[contenteditable]"),
-        (By.CSS_SELECTOR, "textarea"),
-        (By.XPATH, "//div[@role='textbox']"),
-    ], timeout=20)
-    if not prompt_el:
-        log.error("Gemini: prompt input not found")
-        return None
-
-    # ── 2. Type the prompt ─────────────────────────────────────────────────
-    prompt_el.click()
-    time.sleep(0.5)
-    slow_type(prompt_el, f"Create an image: {prompt[:450]}")
-    time.sleep(1)
-
-    # ── 3. Submit ──────────────────────────────────────────────────────────
-    submit_el = find_first(driver, [
-        (By.CSS_SELECTOR, "button[aria-label='Send message']"),
-        (By.CSS_SELECTOR, "button.send-button"),
-        (By.XPATH, "//button[contains(@aria-label,'Send')]"),
-        (By.XPATH, "//mat-icon[text()='send']/parent::button"),
-    ], timeout=5)
-    if submit_el:
-        driver.execute_script("arguments[0].click();", submit_el)
-    else:
-        prompt_el.send_keys(Keys.RETURN)
-    log.info("Gemini: generating… (up to 120 s)")
-    time.sleep(15)
-
-    return _wait_for_large_image(driver, timeout=105, cdn_hints=[
-        "googleusercontent.com", "lh3.googleusercontent", "generativelanguage",
-        "gemini", "image-generation",
-    ])
-
-
-# ── Source dispatch table ─────────────────────────────────────────────────────
-
-_GENERATOR_FNS = {
-    "grok":     None,                   # handled inside generate_image() directly
-    "leonardo": generate_via_leonardo,
-    "firefly":  generate_via_firefly,
-    "chatgpt":  generate_via_chatgpt,
-    "raphael":  generate_via_raphael,
-    "gemini":   generate_via_gemini,
-}
-
-_SOURCE_URLS = {
-    "grok":     GROK_URL,
-    "leonardo": LEONARDO_URL,
-    "firefly":  FIREFLY_URL,
-    "chatgpt":  CHATGPT_URL,
-    "raphael":  RAPHAEL_URL,
-    "gemini":   GEMINI_URL,
-}
-
-
-def _screenshot(driver, label: str) -> None:
-    try:
-        driver.save_screenshot(
-            str(LOG_DIR / f"{label}_{datetime.now().strftime('%H%M%S')}.png")
+        resp = requests.get(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+                "Referer": "https://pollinations.ai/",
+            },
+            timeout=120,
+            stream=True,
         )
-    except Exception:
-        pass
+        if resp.status_code != 200:
+            log.warning(f"Pollinations: HTTP {resp.status_code}")
+            return None
+
+        now  = datetime.now()
+        slug = re.sub(r"[^\w]+", "_", prompt[:50]).strip("_")
+        filepath = SAVE_DIR / f"{now.strftime('%Y%m%d_%H%M%S')}_{slug}.png"
+        SAVE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(filepath, "wb") as f:
+            for chunk in resp.iter_content(8192):
+                f.write(chunk)
+
+        size_kb = filepath.stat().st_size // 1024
+        if size_kb < 30:
+            log.warning(f"Pollinations: image too small ({size_kb} KB) — discarding")
+            filepath.unlink(missing_ok=True)
+            return None
+
+        # Write sidecar meta JSON
+        meta = {
+            "generated_at": now.isoformat(),
+            "prompt":       prompt,
+            "source":       "pollinations",
+            "components":   {},
+        }
+        filepath.with_name(filepath.stem + "_meta.json").write_text(
+            json.dumps(meta, indent=2), encoding="utf-8"
+        )
+        log.info(f"Pollinations: saved {filepath.name} ({size_kb} KB)")
+        return f"SAVED:{filepath}"
+    except Exception as exc:
+        log.warning(f"Pollinations: {exc}")
+        return None
 
 
-# ── Entry points ───────────────────────────────────────────────────────────────
+# ── Main image generator ──────────────────────────────────────────────────────
 
-def _load_series_manifest() -> dict:
-    if SERIES_MANIFEST.exists():
+def generate_image(prompt: str, components: dict, cfg: dict) -> str | None:
+    """Try Grok first, fall back to ChatGPT, then Pollinations. Returns saved filepath or None."""
+    sources = [
+        ("grok",         _generate_via_grok,         ["grokusercontent", "assets.grok.com"]),
+        ("chatgpt",      _generate_via_chatgpt,       ["oaiusercontent", "oaidalleapiprodscus"]),
+        ("pollinations", _generate_via_pollinations,  ["pollinations"]),
+    ]
+    for source, gen_fn, cdn_hints in sources:
+        log.info(f"Trying {source}…")
+        driver = None
         try:
-            with open(SERIES_MANIFEST, "r", encoding="utf-8") as f:
-                return json.load(f)
+            driver = make_driver(cfg)
+            img_url = gen_fn(driver, prompt)
+            if img_url:
+                if img_url.startswith("SAVED:"):
+                    filepath = img_url[6:]
+                    log.info(f"Generated via {source}: {Path(filepath).name}")
+                    return filepath
+                filepath = _save_image(driver, img_url, prompt, source, components)
+                if filepath:
+                    log.info(f"Generated via {source}: {Path(filepath).name}")
+                    return filepath
+            log.warning(f"{source} failed — trying next source")
+        except Exception as exc:
+            log.error(f"{source} error: {exc}", exc_info=True)
+        finally:
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+    log.error("All sources failed — no image generated this run")
+    return None
+
+
+# ── Main run function ─────────────────────────────────────────────────────────
+
+def run() -> bool:
+    """Generate 1 image, post to Instagram, engage. Returns True on success."""
+    # Prevent overlapping runs
+    if LOCK_FILE.exists():
+        try:
+            age_s = time.time() - LOCK_FILE.stat().st_mtime
+            if age_s < 7200:
+                log.warning(f"Lock file exists ({age_s:.0f}s old) — another run active. Exiting.")
+                return False
+            else:
+                log.warning(f"Stale lock ({age_s:.0f}s) — removing and continuing.")
+                LOCK_FILE.unlink()
         except Exception:
             pass
-    return {"series": {}}
+
+    LOCK_FILE.write_text(str(datetime.now()))
+    try:
+        return _run_inner()
+    finally:
+        try:
+            LOCK_FILE.unlink()
+        except Exception:
+            pass
 
 
-def _save_series_manifest(manifest: dict) -> None:
-    with open(SERIES_MANIFEST, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-
-
-def run_series(n: int = 3) -> list[str]:
-    """
-    Generate N variations of the same base subject/environment, each through a
-    different AI tool. Saves a series_manifest.json entry with posted=false.
-    Returns list of saved filepaths (may be fewer than N if some tools fail).
-    """
+def _run_inner() -> bool:
     log.info("=" * 60)
-    log.info(f"AI Art Bot — Series Mode ({n} variations) — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    log.info(f"AI Art Bot — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    log.info("=" * 60)
 
     cfg = load_config()
 
-    # 1. Load engagement weights for subject + environment selection
-    weights: dict = {}
+    # 1. Build prompt
+    prompt, components = build_prompt()
+    prompt = prompt.rstrip(". ") + ". Psychedelic, 3D, Art."
+    log.info(f"Prompt: {prompt[:100]}…")
+
+    # 2. Generate image
+    filepath = generate_image(prompt, components, cfg)
+    if not filepath:
+        log.error("Image generation failed — skipping post")
+        cfg["last_run"] = datetime.now().isoformat()
+        save_config(cfg)
+        return False
+
+    # 3. Post to Instagram
+    posted   = False
+    caption  = ""
     try:
-        import engagement_learner as _el
-        _data = _el.load_engagement_data()
-        weights = _el.get_all_weights(_data, {
-            "subject":     SUBJECTS,
-            "environment": ENVIRONMENTS,
-        })
-    except Exception as exc:
-        log.debug(f"[engagement] weight load skipped: {exc}")
-
-    # 2. Pick shared base subject + environment
-    base_subject = _weighted_choice(SUBJECTS,      weights.get("subject"))
-    base_env     = _weighted_choice(ENVIRONMENTS,  weights.get("environment"))
-    log.info(f"Base subject    : {base_subject}")
-    log.info(f"Base environment: {base_env}")
-
-    # 3. Build N variation components (unique style+mood per variation)
-    variations = _build_variation_components(base_subject, base_env, n)
-
-    # 4. Assign a different tool to each variation
-    series_id      = datetime.now().strftime("%Y%m%d_%H%M%S")
-    shuffled       = random.sample(SOURCES, len(SOURCES))
-    assigned_tools = shuffled[:n]
-    log.info(f"Series ID: {series_id} — tools: {assigned_tools}")
-
-    results: list[str] = []
-
-    for idx, (comps, tool) in enumerate(zip(variations, assigned_tools), start=1):
-        # 5. Inject series metadata
-        comps["series_id"]    = series_id
-        comps["series_idx"]   = idx
-        comps["series_total"] = n
-
-        prompt = _build_variation_prompt(comps)
-        log.info(f"  [{idx}/{n}] {tool.upper()}: {prompt[:80]}")
-
-        filepath: str | None = None
-        try:
-            if tool == "grok":
-                filepath = generate_image(prompt, cfg, components=comps)
-            else:
-                driver = make_driver(cfg)
-                try:
-                    url = _GENERATOR_FNS[tool](driver, prompt)
-                    if url:
-                        filepath = download_image(
-                            driver, url, prompt,
-                            referer=_SOURCE_URLS[tool],
-                            source_name=tool,
-                            components=comps,
-                        )
-                finally:
-                    try:
-                        driver.quit()
-                    except Exception:
-                        pass
-        except Exception as exc:
-            log.error(f"[{tool}] variation {idx} failed: {exc}")
-
-        if filepath:
-            log.info(f"  ✓ [{tool}] Saved → {filepath}")
-            results.append(filepath)
+        from instagram_bot import InstagramBot, build_caption, load_tracker, mark_posted, save_tracker
+        img_path = Path(filepath)
+        caption  = build_caption(img_path)
+        bot      = InstagramBot(cfg)
+        success, post_url = bot.post_image(img_path, caption)
+        if success:
+            tracker = load_tracker()
+            mark_posted(tracker, img_path, post_url)
+            save_tracker(tracker)
+            log.info(f"Posted → {post_url or 'no URL captured'}")
+            posted = True
         else:
-            log.warning(f"  ✗ [{tool}] variation {idx} failed")
+            log.warning("Instagram post failed")
+    except Exception as exc:
+        log.error(f"Instagram error: {exc}")
 
-        # Brief pause between tool calls
-        if idx < n:
-            time.sleep(5)
+    # 4. Engage (only after a successful post)
+    if posted:
+        try:
+            from engagement_bot import run_post_engagement
+            run_post_engagement(cfg, caption)
+        except Exception as exc:
+            log.warning(f"Engagement error (non-fatal): {exc}")
 
-    # 6. Save manifest entry if any images were generated
-    if results:
-        manifest = _load_series_manifest()
-        manifest["series"][series_id] = {
-            "files":               [Path(fp).name for fp in results],
-            "base_subject":        base_subject,
-            "base_env":            base_env,
-            "variation_components": variations,
-            "generated_at":        datetime.now().isoformat(),
-            "posted":              False,
-        }
-        _save_series_manifest(manifest)
-        log.info(f"Series manifest saved — {len(results)}/{n} images generated")
-    else:
-        log.error("✗ All variations failed this series run")
-
-    # 7. Update config
     cfg["last_run"] = datetime.now().isoformat()
     save_config(cfg)
 
-    # 8. Auto-post to Instagram immediately after saving
-    if results:
+    log.info("=" * 60)
+    log.info(f"Run complete — {'SUCCESS' if posted else 'PARTIAL (image saved, post failed)'}")
+    return posted
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import sys
+    import ctypes
+
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
+
+    if cmd == "run":
         try:
-            from instagram_bot import (
-                InstagramBot, load_config as _ig_load_config,
-                build_series_caption, pick_unposted_series,
-                mark_series_posted, load_tracker,
-            )
-            ig_cfg         = _ig_load_config()
-            series_result  = pick_unposted_series()
-            if series_result:
-                s_id, s_data, s_paths = series_result
-                caption  = build_series_caption(s_data)
-                tracker  = load_tracker()
-                bot      = InstagramBot(ig_cfg)
-                log.info(f"Auto-posting series {s_id} to Instagram…")
-                success, post_url = bot.post_series([str(p) for p in s_paths], caption)
-                if success:
-                    mark_series_posted(s_id, [str(p) for p in s_paths], tracker, post_url)
-                    log.info("Series auto-posted to Instagram successfully.")
-                else:
-                    log.warning("Instagram auto-post failed — series saved for manual posting via: python instagram_bot.py force")
-            else:
-                log.warning("Auto-post: no unposted series found (unexpected)")
+            success = run()
         except Exception as exc:
-            log.warning(f"Instagram auto-post failed (non-fatal): {exc}")
+            log.critical(f"Unhandled exception in run(): {exc}", exc_info=True)
+            sys.exit(2)
+        sys.exit(0 if success else 1)
 
-    return results
-
-
-def run_once() -> str | None:
-    """Generate a series of 3 images. Returns the first successful filepath."""
-    results = run_series(n=3)
-    return results[0] if results else None
-
-
-def post_to_instagram(image_path: str, caption: str, cfg: dict) -> bool:
-    """
-    TODO: Instagram upload — will be implemented as a separate agent.
-    Placeholder so the interface is ready.
-    """
-    log.info(f"[Instagram] Upload pending implementation — {image_path}")
-    return False
-
-
-def setup_login() -> None:
-    """
-    One-time setup: open Chrome with the bot profile, navigate to grok.com,
-    and wait for the user to log in manually via a Windows dialog.
-    The session is saved to the bot profile and reused on every subsequent run.
-    """
-    import ctypes
-    cfg = load_config()
-    print()
-    print("=" * 60)
-    print("  GROK LOGIN SETUP")
-    print("=" * 60)
-    print()
-    print("Chrome is opening grok.com now...")
-    print("Log in with your X account, then click OK in the popup dialog.")
-    print()
-
-    driver = make_driver(cfg)
-    try:
-        driver.get(GROK_URL)
-        # Show a Windows message box — works even when stdin is not a terminal
-        ctypes.windll.user32.MessageBoxW(
-            0,
-            "Log in to grok.com in the Chrome window, then click OK to save your session.",
-            "Grok Login Setup",
-            0x00000040  # MB_ICONINFORMATION
-        )
-        print("Session saved to bot profile.")
-        print("You can now run:  python art_bot.py run")
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-
-
-def fill_stock(target: int = 25) -> None:
-    """Generate images back-to-back until SAVE_DIR contains at least `target` PNGs."""
-    existing = len(list(SAVE_DIR.glob("*.png")))
-    needed   = max(0, target - existing)
-    print(f"Current images: {existing}  |  Target: {target}  |  Need: {needed} more")
-
-    if needed == 0:
-        print("Already at target — nothing to do.")
-        return
-
-    success = 0
-    fail    = 0
-
-    for i in range(1, needed + 1):
-        current = len(list(SAVE_DIR.glob("*.png")))
-        if current >= target:
-            print(f"\nTarget reached: {current} images in folder.")
-            break
-
-        print(f"\n[{i}/{needed}]  Generating image {current + 1}…")
-        result = run_once()
-
-        if result:
-            success += 1
-        else:
-            fail += 1
-            print("  (failed — continuing to next)")
-
-        # Brief pause between runs so Grok doesn't rate-limit
-        if i < needed:
-            print("  Pausing 8 s before next run…")
-            time.sleep(8)
-
-    final = len(list(SAVE_DIR.glob("*.png")))
-    print(f"\nDone. {success} generated, {fail} failed. Total in folder: {final}")
-
-
-_LOGIN_SITES = {
-    "grok":      (GROK_URL,     "grok.com",       "Log in to grok.com with your X account"),
-    "leonardo":  (LEONARDO_URL, "Leonardo.ai",    "Log in to Leonardo.ai (Google or email)"),
-    "firefly":   (FIREFLY_URL,  "Adobe Firefly",  "Log in to Adobe Firefly with your Adobe account"),
-    "chatgpt":   (CHATGPT_URL,  "ChatGPT",        "Log in to ChatGPT with your OpenAI account"),
-    "raphael":   (RAPHAEL_URL,  "Raphael.app",    "Log in to Raphael.app (Google or email)"),
-    "gemini":    (GEMINI_URL,   "Google Gemini",  "Log in to Gemini with your Google account"),
-}
-
-
-def setup_login_site(site: str = "grok") -> None:
-    """Open any supported site in the bot Chrome profile for manual login."""
-    import ctypes
-    info = _LOGIN_SITES.get(site.lower())
-    if not info:
-        print(f"Unknown site '{site}'. Choose from: {', '.join(_LOGIN_SITES)}")
-        return
-
-    url, label, instruction = info
-    cfg = load_config()
-    print(f"\nOpening {label} for login setup…")
-    driver = make_driver(cfg)
-    try:
+    elif cmd == "login":
+        site = sys.argv[2].lower() if len(sys.argv) > 2 else "grok"
+        urls = {
+            "grok":      GROK_URL,
+            "chatgpt":   CHATGPT_URL,
+            "instagram": "https://www.instagram.com/",
+        }
+        url = urls.get(site)
+        if not url:
+            print(f"Unknown site '{site}'. Choose from: {', '.join(urls)}")
+            sys.exit(1)
+        print(f"Opening {site} for manual login…")
+        cfg    = load_config()
+        driver = make_driver(cfg, headless=False)
         driver.get(url)
         ctypes.windll.user32.MessageBoxW(
             0,
-            f"{instruction}, then click OK to save your session.",
-            f"{label} Login Setup",
+            f"Log in to {site} in Chrome, then click OK to save the session.",
+            "Login Setup",
             0x00000040,
         )
-        print(f"Session saved for {label}.")
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        print("Session saved.")
+        driver.quit()
 
-
-def main():
-    import sys
-    if len(sys.argv) > 1:
-        cmd = sys.argv[1].lower()
-        if cmd == "test":
-            prompt, components = build_prompt()
-            print("Sample prompt:")
-            print(prompt)
-            print("\nComponents:")
-            for k, v in components.items():
-                print(f"  {k}: {v[:80]}")
-        elif cmd == "run":
-            run_series(n=3)
-        elif cmd == "series":
-            n = int(sys.argv[2]) if len(sys.argv) > 2 else 3
-            run_series(n=n)
-        elif cmd == "login":
-            # login [site [site ...]]  — one or more sites, or "all"
-            sites = [s.lower() for s in sys.argv[2:]] if len(sys.argv) > 2 else ["grok"]
-            if sites == ["all"]:
-                sites = list(_LOGIN_SITES.keys())
-            for site in sites:
-                setup_login_site(site)
-        elif cmd == "fill":
-            target = int(sys.argv[2]) if len(sys.argv) > 2 else 25
-            fill_stock(target)
-        else:
-            print("Usage:  python art_bot.py [run|series|fill|login|test]")
-            print()
-            print("  run           — generate a 3-image series across 3 different tools")
-            print("  series [N]    — generate an N-image series (default 3)")
-            print("  fill [N]      — generate series back-to-back until folder has N images (default 25)")
-            print("  login [site]  — log in to a source site and save session")
-            print("                  sites: grok, leonardo, firefly, chatgpt, raphael, gemini, all")
-            print("  test          — print a sample prompt, no browser opened")
     else:
-        run_series(n=3)
-
-
-if __name__ == "__main__":
-    main()
+        print(f"Unknown command: {cmd}")
+        print("Usage: python art_bot.py [run|login [grok|chatgpt|instagram]]")
+        sys.exit(1)
